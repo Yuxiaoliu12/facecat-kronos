@@ -34,6 +34,35 @@ def init_qlib(cfg: ScreenerConfig | None = None):
     qlib.init(provider_uri=provider, region=REG_CN)
 
 
+def _resolve_instruments(cfg: ScreenerConfig, start: str, end: str) -> list[str]:
+    """Read instrument list from Qlib data files directly.
+
+    Bypasses D.instruments() / DatasetProvider.dataset() which has
+    inst_processors compatibility issues in newer Qlib versions.
+    """
+    data_dir = os.path.expanduser(cfg.qlib_data_path)
+    inst_file = os.path.join(data_dir, "instruments", f"{cfg.universe}.txt")
+
+    symbols = []
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    with open(inst_file, "r") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                sym = parts[0]
+                sym_start = pd.Timestamp(parts[1])
+                sym_end = pd.Timestamp(parts[2])
+                if sym_start <= end_ts and sym_end >= start_ts:
+                    symbols.append(sym)
+            elif len(parts) >= 1 and parts[0]:
+                symbols.append(parts[0])
+
+    print(f"Resolved {len(symbols)} instruments from {inst_file}")
+    return symbols
+
+
 # ── Alpha158-equivalent features via D.features() ──────────────────────────
 
 def _alpha158_exprs() -> tuple[list[str], list[str]]:
@@ -138,8 +167,9 @@ def load_alpha158_factors(
 
     print("Computing Alpha158 factors via D.features() (this may take a few minutes)…")
     exprs, feat_names = _alpha158_exprs()
+    symbols = _resolve_instruments(cfg, start, end)
 
-    df = D.features(cfg.universe, exprs, start_time=start, end_time=end, freq="day")
+    df = D.features(symbols, exprs, start_time=start, end_time=end, freq="day")
     df.columns = feat_names
 
     # Cross-sectional RobustZScore normalisation per day
@@ -172,7 +202,8 @@ def load_alpha158_labels(
     end = end or cfg.backtest_end
 
     # Load close prices
-    close_df = D.features(cfg.universe, ["$close"], start_time=start, end_time=end, freq="day")
+    symbols = _resolve_instruments(cfg, start, end)
+    close_df = D.features(symbols, ["$close"], start_time=start, end_time=end, freq="day")
     close_df.columns = ["close"]
 
     # Forward N-day return per stock
@@ -247,8 +278,9 @@ def _compute_market_breadth(
 ) -> pd.Series:
     """Fraction of universe stocks whose close > MA20."""
     close_fields = ["$close"]
+    symbols = _resolve_instruments(cfg, start, end)
     close_df = D.features(
-        cfg.universe, close_fields, start_time=start, end_time=end, freq="day"
+        symbols, close_fields, start_time=start, end_time=end, freq="day"
     )
     close_df.columns = ["close"]
 
@@ -269,8 +301,9 @@ def _compute_sector_returns(
     proxy: compute the equal-weight 20-day return for each exchange-board
     grouping (by code prefix).
     """
+    symbols = _resolve_instruments(cfg, start, end)
     close_df = D.features(
-        cfg.universe, ["$close"], start_time=start, end_time=end, freq="day"
+        symbols, ["$close"], start_time=start, end_time=end, freq="day"
     )
     close_df.columns = ["close"]
     close_unstacked = close_df["close"].unstack("instrument")
