@@ -61,21 +61,29 @@ def load_alpha158_factors(
     print("Computing Alpha158 factors via Qlib (this may take a few minutes)…")
     from qlib.contrib.data.handler import Alpha158
 
-    handler = Alpha158(
-        instruments=cfg.universe,
-        start_time=start,
-        end_time=end,
-        fit_start_time=start,
-        fit_end_time=cfg.train_end,  # fit normaliser on train period only
-        infer_processors=[
-            {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-        ],
-        learn_processors=[
-            {"class": "DropnaLabel"},
-            {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-        ],
-    )
+    try:
+        handler = Alpha158(
+            instruments=cfg.universe,
+            start_time=start,
+            end_time=end,
+            fit_start_time=start,
+            fit_end_time=cfg.train_end,
+            infer_processors=[
+                {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+                {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+            ],
+            learn_processors=[
+                {"class": "DropnaLabel"},
+                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
+            ],
+        )
+    except TypeError:
+        # Newer Qlib versions removed inst_processors from __init__ signature
+        handler = Alpha158(
+            instruments=cfg.universe,
+            start_time=start,
+            end_time=end,
+        )
     df = handler.fetch(col_set="feature")
 
     # Persist
@@ -98,17 +106,24 @@ def load_alpha158_labels(
 
     from qlib.contrib.data.handler import Alpha158
 
-    handler = Alpha158(
-        instruments=cfg.universe,
-        start_time=start,
-        end_time=end,
-        fit_start_time=start,
-        fit_end_time=cfg.train_end,
-        learn_processors=[
-            {"class": "DropnaLabel"},
-            {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-        ],
-    )
+    try:
+        handler = Alpha158(
+            instruments=cfg.universe,
+            start_time=start,
+            end_time=end,
+            fit_start_time=start,
+            fit_end_time=cfg.train_end,
+            learn_processors=[
+                {"class": "DropnaLabel"},
+                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
+            ],
+        )
+    except TypeError:
+        handler = Alpha158(
+            instruments=cfg.universe,
+            start_time=start,
+            end_time=end,
+        )
     label_df = handler.fetch(col_set="label")
     return label_df.iloc[:, 0] if isinstance(label_df, pd.DataFrame) else label_df
 

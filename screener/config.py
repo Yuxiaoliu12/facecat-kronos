@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 class ScreenerConfig:
     # ── Qlib / Universe ──────────────────────────────────────────────────
     qlib_data_path: str = "~/.qlib/qlib_data/cn_data"
-    universe: str = "csi1000"
-    benchmark: str = "SH000852"
+    universe: str = "csi500"
+    benchmark: str = "SH000905"
 
     # ── Layer 1 — Factor Timing (XGBoost) ────────────────────────────────
     layer1_top_n: int = 200
