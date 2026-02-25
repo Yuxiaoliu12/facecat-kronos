@@ -2,6 +2,8 @@
 Data pipeline: Qlib init, Alpha158 factor computation, regime features, raw OHLCV.
 
 Follows the same Qlib patterns as ``finetune/qlib_data_preprocess.py``.
+Alpha158 features are computed directly via D.features() with Qlib expressions,
+bypassing the Alpha158 handler which has compatibility issues across Qlib versions.
 """
 
 import os
@@ -32,7 +34,83 @@ def init_qlib(cfg: ScreenerConfig | None = None):
     qlib.init(provider_uri=provider, region=REG_CN)
 
 
-# ── Alpha158 Factors ─────────────────────────────────────────────────────────
+# ── Alpha158-equivalent features via D.features() ──────────────────────────
+
+def _alpha158_exprs() -> tuple[list[str], list[str]]:
+    """Return (expressions, names) for Alpha158-equivalent features.
+
+    Produces ~109 features covering all Alpha158 categories:
+    momentum, trend, volatility, price_extreme, mean_reversion,
+    correlation, volume_price, volume, cross_section.
+    """
+    exprs = []
+    names = []
+
+    # KBAR features (9)
+    kbar = [
+        ("($close-$open)/$open", "KMID$0"),
+        ("($high-$low)/$open", "KLEN$0"),
+        ("($close-$open)/($high-$low+1e-12)", "KMID2$0"),
+        ("($high-Greater($open,$close))/$open", "KUP$0"),
+        ("($high-Greater($open,$close))/($high-$low+1e-12)", "KUP2$0"),
+        ("(Less($open,$close)-$low)/$open", "KLOW$0"),
+        ("(Less($open,$close)-$low)/($high-$low+1e-12)", "KLOW2$0"),
+        ("(2*$close-$high-$low)/$open", "KSFT$0"),
+        ("(2*$close-$high-$low)/($high-$low+1e-12)", "KSFT2$0"),
+    ]
+    for expr, name in kbar:
+        exprs.append(expr)
+        names.append(name)
+
+    # Rolling features for windows [5, 10, 20, 30, 60]
+    for N in [5, 10, 20, 30, 60]:
+        rolling = [
+            # momentum / trend
+            (f"Ref($close,{N})/$close", f"ROC${N}"),
+            (f"Mean($close,{N})/$close", f"MA${N}"),
+            # volatility
+            (f"Std($close,{N})/$close", f"STD${N}"),
+            # price_extreme
+            (f"Max($high,{N})/$close", f"MAX${N}"),
+            (f"Min($low,{N})/$close", f"MIN${N}"),
+            # mean_reversion
+            (f"($close-Min($low,{N}))/(Max($high,{N})-Min($low,{N})+1e-12)", f"RSV${N}"),
+            # correlation
+            (f"Corr($close,Log($volume+1),{N})", f"CORR${N}"),
+            (f"Corr($close/Ref($close,1),Log($volume/Ref($volume,1)+1),{N})", f"CORD${N}"),
+            # volume_price
+            (f"Mean($close>Ref($close,1),{N})", f"CNTP${N}"),
+            (f"Mean($close<Ref($close,1),{N})", f"CNTN${N}"),
+            (f"Mean($close>Ref($close,1),{N})-Mean($close<Ref($close,1),{N})", f"CNTD${N}"),
+            (f"Sum(Greater($close-Ref($close,1),0),{N})/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)", f"SUMP${N}"),
+            (f"Sum(Greater(Ref($close,1)-$close,0),{N})/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)", f"SUMN${N}"),
+            (
+                f"(Sum(Greater($close-Ref($close,1),0),{N})-Sum(Greater(Ref($close,1)-$close,0),{N}))"
+                f"/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)",
+                f"SUMD${N}",
+            ),
+            # volume
+            (f"Mean($volume,{N})/($volume+1e-12)", f"VMA${N}"),
+            (f"Std($volume,{N})/($volume+1e-12)", f"VSTD${N}"),
+            (
+                f"Std(Abs($close/Ref($close,1)-1)*$volume,{N})"
+                f"/(Mean(Abs($close/Ref($close,1)-1)*$volume,{N})+1e-12)",
+                f"WVMA${N}",
+            ),
+            (f"Sum(If($close>Ref($close,1),$volume,0),{N})/(Sum($volume,{N})+1e-12)", f"VSUMP${N}"),
+            (f"Sum(If($close<Ref($close,1),$volume,0),{N})/(Sum($volume,{N})+1e-12)", f"VSUMN${N}"),
+            (
+                f"(Sum(If($close>Ref($close,1),$volume,0),{N})-Sum(If($close<Ref($close,1),$volume,0),{N}))"
+                f"/(Sum($volume,{N})+1e-12)",
+                f"VSUMD${N}",
+            ),
+        ]
+        for expr, name in rolling:
+            exprs.append(expr)
+            names.append(name)
+
+    return exprs, names
+
 
 def load_alpha158_factors(
     cfg: ScreenerConfig,
@@ -41,9 +119,9 @@ def load_alpha158_factors(
     *,
     cache: bool = True,
 ) -> pd.DataFrame:
-    """Load Alpha158 cross-sectional factors for the whole universe.
+    """Load Alpha158-equivalent cross-sectional factors for the whole universe.
 
-    Returns a DataFrame with MultiIndex (datetime, instrument) and 158 factor
+    Returns a DataFrame with MultiIndex (datetime, instrument) and ~109 factor
     columns.  Results are cached to ``cfg.alpha158_cache`` on first call.
     """
     start = start or cfg.train_start
@@ -58,33 +136,22 @@ def load_alpha158_factors(
         )
         return df.loc[mask]
 
-    print("Computing Alpha158 factors via Qlib (this may take a few minutes)…")
-    from qlib.contrib.data.handler import Alpha158
+    print("Computing Alpha158 factors via D.features() (this may take a few minutes)…")
+    exprs, feat_names = _alpha158_exprs()
 
-    try:
-        handler = Alpha158(
-            instruments=cfg.universe,
-            start_time=start,
-            end_time=end,
-            fit_start_time=start,
-            fit_end_time=cfg.train_end,
-            infer_processors=[
-                {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
-                {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
-            ],
-            learn_processors=[
-                {"class": "DropnaLabel"},
-                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-            ],
-        )
-    except TypeError:
-        # Newer Qlib versions removed inst_processors from __init__ signature
-        handler = Alpha158(
-            instruments=cfg.universe,
-            start_time=start,
-            end_time=end,
-        )
-    df = handler.fetch(col_set="feature")
+    df = D.features(cfg.universe, exprs, start_time=start, end_time=end, freq="day")
+    df.columns = feat_names
+
+    # Cross-sectional RobustZScore normalisation per day
+    print("Applying cross-sectional RobustZScore normalisation…")
+
+    def _cs_robust_zscore(group, clip=3.0):
+        median = group.median()
+        mad = (group - median).abs().median()
+        return ((group - median) / (1.4826 * mad + 1e-9)).clip(-clip, clip)
+
+    df = df.groupby(level="datetime").transform(_cs_robust_zscore)
+    df = df.fillna(0)
 
     # Persist
     if cache:
@@ -100,32 +167,26 @@ def load_alpha158_labels(
     start: str | None = None,
     end: str | None = None,
 ) -> pd.Series:
-    """Load the Alpha158 labels (forward returns, CSRankNorm'd)."""
+    """Load forward return labels (CSRankNorm'd)."""
     start = start or cfg.train_start
     end = end or cfg.backtest_end
 
-    from qlib.contrib.data.handler import Alpha158
+    # Load close prices
+    close_df = D.features(cfg.universe, ["$close"], start_time=start, end_time=end, freq="day")
+    close_df.columns = ["close"]
 
-    try:
-        handler = Alpha158(
-            instruments=cfg.universe,
-            start_time=start,
-            end_time=end,
-            fit_start_time=start,
-            fit_end_time=cfg.train_end,
-            learn_processors=[
-                {"class": "DropnaLabel"},
-                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-            ],
-        )
-    except TypeError:
-        handler = Alpha158(
-            instruments=cfg.universe,
-            start_time=start,
-            end_time=end,
-        )
-    label_df = handler.fetch(col_set="label")
-    return label_df.iloc[:, 0] if isinstance(label_df, pd.DataFrame) else label_df
+    # Forward N-day return per stock
+    fwd = cfg.layer1_forward_days
+    fwd_ret = close_df.groupby(level="instrument")["close"].transform(
+        lambda x: x.shift(-fwd) / x - 1
+    )
+    fwd_ret = fwd_ret.dropna()
+
+    # Cross-sectional rank normalisation per day (centre around 0)
+    labels = fwd_ret.groupby(level="datetime").transform(
+        lambda g: g.rank(pct=True) - 0.5
+    )
+    return labels
 
 
 # ── Market Regime Features ───────────────────────────────────────────────────
