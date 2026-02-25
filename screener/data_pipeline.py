@@ -29,9 +29,28 @@ from screener.utils import (
 
 def init_qlib(cfg: ScreenerConfig | None = None):
     """Initialise Qlib (idempotent — safe to call multiple times)."""
+    _patch_qlib_parallel()
     cfg = cfg or ScreenerConfig()
     provider = os.path.expanduser(cfg.qlib_data_path)
     qlib.init(provider_uri=provider, region=REG_CN)
+
+
+def _patch_qlib_parallel():
+    """Fix ParallelExt._backend_args AttributeError in newer joblib versions."""
+    try:
+        import qlib.utils.paral as _paral
+        _orig_init = _paral.ParallelExt.__init__
+
+        def _patched_init(self, *args, **kwargs):
+            try:
+                _orig_init(self, *args, **kwargs)
+            except AttributeError:
+                # _backend_args was removed in newer joblib; skip maxtasksperchild
+                pass
+
+        _paral.ParallelExt.__init__ = _patched_init
+    except Exception:
+        pass
 
 
 def _qlib_features(instruments, fields, start_time=None, end_time=None, freq="day"):
