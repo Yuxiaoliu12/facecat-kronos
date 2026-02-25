@@ -34,6 +34,23 @@ def init_qlib(cfg: ScreenerConfig | None = None):
     qlib.init(provider_uri=provider, region=REG_CN)
 
 
+def _qlib_features(instruments, fields, start_time=None, end_time=None, freq="day"):
+    """Replacement for D.features() that avoids the inst_processors bug.
+
+    Qlib's D.features() passes inst_processors both positionally and as keyword
+    to DatasetD.dataset(), causing a TypeError. This function calls the provider
+    directly using keyword-only arguments to avoid the parameter order conflict.
+    """
+    from qlib.data.data import DatasetD
+    return DatasetD.dataset(
+        instruments=instruments,
+        fields=fields,
+        start_time=start_time,
+        end_time=end_time,
+        freq=freq,
+    )
+
+
 def _resolve_instruments(cfg: ScreenerConfig, start: str, end: str) -> list[str]:
     """Read instrument list from Qlib data files directly.
 
@@ -169,7 +186,7 @@ def load_alpha158_factors(
     exprs, feat_names = _alpha158_exprs()
     symbols = _resolve_instruments(cfg, start, end)
 
-    df = D.features(symbols, exprs, start_time=start, end_time=end, freq="day")
+    df = _qlib_features(symbols, exprs, start_time=start, end_time=end, freq="day")
     df.columns = feat_names
 
     # Cross-sectional RobustZScore normalisation per day
@@ -203,7 +220,7 @@ def load_alpha158_labels(
 
     # Load close prices
     symbols = _resolve_instruments(cfg, start, end)
-    close_df = D.features(symbols, ["$close"], start_time=start, end_time=end, freq="day")
+    close_df = _qlib_features(symbols, ["$close"], start_time=start, end_time=end, freq="day")
     close_df.columns = ["close"]
 
     # Forward N-day return per stock
@@ -246,7 +263,7 @@ def load_market_regime_features(
     # Market-level features from benchmark index
     benchmark = cfg.benchmark
     index_fields = ["$close", "$open", "$high", "$low", "$volume"]
-    idx_df = D.features(
+    idx_df = _qlib_features(
         [benchmark], index_fields, start_time=start, end_time=end, freq="day"
     )
     # Flatten MultiIndex
@@ -279,7 +296,7 @@ def _compute_market_breadth(
     """Fraction of universe stocks whose close > MA20."""
     close_fields = ["$close"]
     symbols = _resolve_instruments(cfg, start, end)
-    close_df = D.features(
+    close_df = _qlib_features(
         symbols, close_fields, start_time=start, end_time=end, freq="day"
     )
     close_df.columns = ["close"]
@@ -302,7 +319,7 @@ def _compute_sector_returns(
     grouping (by code prefix).
     """
     symbols = _resolve_instruments(cfg, start, end)
-    close_df = D.features(
+    close_df = _qlib_features(
         symbols, ["$close"], start_time=start, end_time=end, freq="day"
     )
     close_df.columns = ["close"]
