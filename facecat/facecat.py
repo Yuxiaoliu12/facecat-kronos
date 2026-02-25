@@ -510,7 +510,7 @@ class GdiPlusPaint(object):
 	def __init__(self):
 		self.gdiPlus = None #GDI+对象
 		self.gID = 0 #GDI+的编号
-		self.encoding = "gbk" #解析编码
+		self.encoding = "utf-8" #解析编码
 	def init(self):
 		"""初始化"""
 		current_file_path = os.path.abspath(__file__)
