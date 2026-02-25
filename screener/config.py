@@ -75,11 +75,11 @@ class ScreenerConfig:
 
     # ── Time Ranges ──────────────────────────────────────────────────────
     train_start: str = "2015-01-01"
-    train_end: str = "2021-12-31"
-    val_start: str = "2022-01-01"
-    val_end: str = "2023-06-30"
-    backtest_start: str = "2023-07-01"
-    backtest_end: str = "2025-06-05"
+    train_end: str = "2019-06-30"
+    val_start: str = "2019-07-01"
+    val_end: str = "2020-03-31"
+    backtest_start: str = "2020-04-01"
+    backtest_end: str = "2020-09-25"
 
     retrain_freq: str = "Q"  # quarterly
 
