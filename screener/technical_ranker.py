@@ -182,7 +182,17 @@ class TechnicalRanker:
         """Precompute technical features for all stocks across full history.
 
         Stores results in self._feature_cache for O(1) lookup by (symbol, date).
+        Uses disk cache to avoid recomputation across runtime restarts.
         """
+        cache_path = os.path.join(self.cfg.model_cache, "layer2_feature_cache.pkl")
+
+        if os.path.exists(cache_path):
+            print(f"Loading Layer 2 feature cache from {cache_path}…", flush=True)
+            with open(cache_path, "rb") as f:
+                self._feature_cache = pickle.load(f)
+            print(f"  Loaded {len(self._feature_cache)} stocks from cache.")
+            return
+
         print(f"Precomputing Layer 2 features for {len(ohlcv_dict)} stocks…", flush=True)
         cache = {}
         skipped = 0
@@ -197,6 +207,11 @@ class TechnicalRanker:
                 continue
         self._feature_cache = cache
         print(f"  Cached {len(cache)} stocks ({skipped} skipped).")
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache, f)
+        print(f"  Saved to {cache_path}")
 
     def compute_features_for_stocks(
         self,
