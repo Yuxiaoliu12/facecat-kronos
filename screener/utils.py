@@ -129,11 +129,15 @@ SHENWAN_L1_SECTORS = [
 def get_board_type(symbol: str) -> str:
     """Determine board type from A-share stock code.
 
+    Supports baostock format (sh.600000, sz.300001) and bare codes (600000).
     Returns one of: 'main', 'gem' (创业板), 'star' (科创板).
     """
-    code = symbol.split(".")[0] if "." in symbol else symbol
-    # Strip exchange prefix if present (e.g. SH600000 -> 600000)
-    code = code.lstrip("SHshSZsz")
+    # baostock format: 'sh.600000' → take part after '.'
+    # Qlib/bare format: '600000' or 'SH600000'
+    if "." in symbol:
+        code = symbol.split(".")[-1]
+    else:
+        code = symbol.lstrip("SHshSZsz")
 
     if code.startswith("300") or code.startswith("301"):
         return "gem"   # 创业板
@@ -148,6 +152,75 @@ def get_limit_threshold(symbol: str, is_ipo_first5: bool = False) -> float:
     if board in ("gem", "star"):
         return 0.30 if is_ipo_first5 else 0.20
     return 0.10
+
+
+def compute_daily_category_ic(
+    alpha158_df: pd.DataFrame,
+    returns: pd.Series,
+    categories: list[str] | None = None,
+    min_valid: int = 10,
+) -> pd.DataFrame:
+    """Vectorized daily Spearman IC per factor category.
+
+    Computes IC = Pearson(rank(category_mean_score), rank(return)) for each
+    (date, category) pair using grouped pandas ops instead of Python loops.
+
+    Args:
+        alpha158_df: Alpha158 features, MultiIndex (datetime, instrument).
+        returns: Forward returns, same MultiIndex as alpha158_df.
+        categories: Subset of categories to compute. Defaults to FACTOR_CATEGORIES.
+        min_valid: Minimum stocks per date to compute IC (else NaN).
+
+    Returns:
+        DataFrame indexed by datetime, one column per category.
+    """
+    categories = categories or FACTOR_CATEGORIES
+    feature_groups = group_features_by_category(list(alpha158_df.columns))
+
+    # Align returns to alpha158 index
+    common_idx = alpha158_df.index.intersection(returns.index)
+    ret = returns.reindex(common_idx)
+    # Rank returns within each date (Spearman = Pearson of ranks)
+    ret_rank = ret.groupby(level="datetime").rank(method="average")
+
+    # Count valid stocks per date for the min_valid filter
+    valid_count = ret_rank.groupby(level="datetime").count()
+
+    results = {}
+    for cat in categories:
+        feats = feature_groups.get(cat, [])
+        if not feats:
+            results[cat] = pd.Series(np.nan, index=valid_count.index)
+            continue
+
+        # Mean factor score for this category across its features
+        cat_score = alpha158_df.reindex(common_idx)[feats].mean(axis=1)
+        cat_rank = cat_score.groupby(level="datetime").rank(method="average")
+
+        # Pearson correlation of ranks per date = Spearman
+        # Merge into a single frame for grouped correlation
+        paired = pd.DataFrame({"s": cat_rank, "r": ret_rank}).dropna()
+        # Grouped Pearson: use groupby().corr() via a pivot trick
+        # More efficient: compute via sum formula per group
+        g = paired.groupby(level="datetime")
+        n = g["s"].count()
+        sum_s = g["s"].sum()
+        sum_r = g["r"].sum()
+        sum_sr = g.apply(lambda x: (x["s"] * x["r"]).sum())
+        sum_s2 = g.apply(lambda x: (x["s"] ** 2).sum())
+        sum_r2 = g.apply(lambda x: (x["r"] ** 2).sum())
+
+        num = n * sum_sr - sum_s * sum_r
+        den = np.sqrt((n * sum_s2 - sum_s**2) * (n * sum_r2 - sum_r**2))
+        ic = num / (den + 1e-12)
+
+        # Mask dates with fewer than min_valid stocks
+        ic[n < min_valid] = np.nan
+        results[cat] = ic
+
+    ic_df = pd.DataFrame(results)
+    ic_df.index.name = "datetime"
+    return ic_df
 
 
 def robust_zscore(series: pd.Series, clip: float = 3.0) -> pd.Series:

@@ -1,8 +1,9 @@
 """
 Layer 2: Technical Ranking Model  (200 → ~30 stocks)
 
-Uses XGBRanker with ``rank:pairwise`` (LambdaMART) to learn cross-sectional
-stock rankings from weekly technical indicators + news sentiment.
+Uses dual XGBRegressor models to predict upside (max-high return) and
+downside (min-low return) over the next 5 days.  Composite score =
+predicted_upside - predicted_downside.
 """
 
 import os
@@ -10,14 +11,14 @@ import pickle
 
 import numpy as np
 import pandas as pd
-from xgboost import XGBRanker
+from xgboost import XGBRegressor
 
 from screener.config import ScreenerConfig
 from screener.news_scorer import NewsScorer
 
 
 class TechnicalRanker:
-    """XGBRanker that ranks stocks by predicted 5-day forward return."""
+    """Dual XGBRegressor that ranks stocks by predicted upside - downside."""
 
     TECH_FEATURES = [
         "macd", "macd_signal", "macd_hist",
@@ -34,8 +35,10 @@ class TechnicalRanker:
 
     def __init__(self, cfg: ScreenerConfig | None = None):
         self.cfg = cfg or ScreenerConfig()
-        self.model: XGBRanker | None = None
+        self.model_upside: XGBRegressor | None = None
+        self.model_downside: XGBRegressor | None = None
         self.news_scorer: NewsScorer | None = None
+        self._feature_cache: dict[str, pd.DataFrame] = {}
 
     # ── Feature Computation ──────────────────────────────────────────────
 
@@ -108,6 +111,95 @@ class TechnicalRanker:
 
         return pd.Series(feats)
 
+    @staticmethod
+    def _compute_technical_features_full(df: pd.DataFrame) -> pd.DataFrame:
+        """Vectorized technical features across the full time series of one stock.
+
+        Same math as compute_technical_features() but returns a DataFrame
+        (dates x 15 features) instead of a single-row Series.
+        """
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        volume = df["volume"] if "volume" in df.columns else df["vol"]
+
+        feats = {}
+
+        # MACD(12,26,9)
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        feats["macd"] = macd_line
+        feats["macd_signal"] = signal_line
+        feats["macd_hist"] = macd_line - signal_line
+
+        # RSI(14), RSI(5)
+        delta = close.diff()
+        for period in [14, 5]:
+            gain = delta.clip(lower=0).rolling(period).mean()
+            loss = (-delta.clip(upper=0)).rolling(period).mean()
+            rs = gain / (loss + 1e-9)
+            feats[f"rsi_{period}"] = 100 - 100 / (1 + rs)
+
+        # MA slopes (normalised by price)
+        for w in [5, 20, 60]:
+            ma = close.rolling(w).mean()
+            shifted = ma.shift(min(w, 5) - 1)  # ma value 5 bars ago (or w bars ago if w<5)
+            feats[f"ma{w}_slope"] = (ma - shifted) / (close + 1e-9)
+
+        # Bollinger Band position
+        ma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        upper = ma20 + 2 * std20
+        lower_bb = ma20 - 2 * std20
+        bb_range = upper - lower_bb
+        feats["bb_position"] = (close - lower_bb) / (bb_range + 1e-9)
+
+        # Volume trend (5-day MA / 20-day MA)
+        vol_ma5 = volume.rolling(5).mean()
+        vol_ma20 = volume.rolling(20).mean()
+        feats["volume_trend"] = vol_ma5 / (vol_ma20 + 1e-9)
+
+        # Momentum (return over N days)
+        for d in [5, 10, 20]:
+            feats[f"mom_{d}"] = close / close.shift(d) - 1
+
+        # ATR(14)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        feats["atr_14"] = tr.rolling(14).mean() / (close + 1e-9)
+
+        # OBV slope (normalised)
+        obv = (np.sign(close.diff()) * volume).cumsum()
+        obv_shifted = obv.shift(5)
+        feats["obv_slope"] = (obv - obv_shifted) / (obv_shifted.abs() + 1e-9)
+
+        return pd.DataFrame(feats, index=df.index).astype(np.float32)
+
+    def precompute_features(self, ohlcv_dict: dict[str, pd.DataFrame]):
+        """Precompute technical features for all stocks across full history.
+
+        Stores results in self._feature_cache for O(1) lookup by (symbol, date).
+        """
+        print(f"Precomputing Layer 2 features for {len(ohlcv_dict)} stocks…", flush=True)
+        cache = {}
+        skipped = 0
+        for sym, df in ohlcv_dict.items():
+            if len(df) < 60:
+                skipped += 1
+                continue
+            try:
+                cache[sym] = self._compute_technical_features_full(df)
+            except Exception:
+                skipped += 1
+                continue
+        self._feature_cache = cache
+        print(f"  Cached {len(cache)} stocks ({skipped} skipped).")
+
     def compute_features_for_stocks(
         self,
         ohlcv_dict: dict[str, pd.DataFrame],
@@ -128,7 +220,17 @@ class TechnicalRanker:
         """
         symbols = symbols or list(ohlcv_dict.keys())
         records = []
+        use_cache = bool(self._feature_cache) and date is not None
         for sym in symbols:
+            if use_cache and sym in self._feature_cache:
+                # O(1) lookup from precomputed cache
+                cached = self._feature_cache[sym]
+                if date in cached.index:
+                    feats = cached.loc[date]
+                    feats.name = sym
+                    records.append(feats)
+                continue
+            # Fallback: compute on the fly (backwards-compatible)
             df = ohlcv_dict.get(sym)
             if df is None or len(df) < 60:
                 continue
@@ -176,21 +278,23 @@ class TechnicalRanker:
         self,
         ohlcv_dict: dict[str, pd.DataFrame],
         dates: list[pd.Timestamp],
-        forward_returns: pd.DataFrame,
+        upside_returns: pd.DataFrame,
+        downside_returns: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Build (X, y, group) arrays for XGBRanker training.
+        """Build (X, y_up, y_down) arrays for dual XGBRegressor training.
 
         Args:
             ohlcv_dict: symbol → full OHLCV history.
             dates: List of training dates.
-            forward_returns: DataFrame (datetime×symbol) of 5-day forward returns.
+            upside_returns: DataFrame (datetime×symbol) of max-high forward returns.
+            downside_returns: DataFrame (datetime×symbol) of min-low forward returns.
 
         Returns:
             X: (total_stocks_across_days, n_features)
-            y: (total_stocks_across_days,) — cross-sectional rank label
-            group: list of group sizes (one per date)
+            y_up: (total_stocks_across_days,) — raw upside values
+            y_down: (total_stocks_across_days,) — raw downside values
         """
-        X_list, y_list, groups = [], [], []
+        X_list, y_up_list, y_down_list = [], [], []
 
         for dt in dates:
             feat_df = self.compute_features_for_stocks(
@@ -200,68 +304,62 @@ class TechnicalRanker:
                 continue
 
             # Get forward returns for this date
-            if dt not in forward_returns.index:
+            if dt not in upside_returns.index or dt not in downside_returns.index:
                 continue
-            fwd = forward_returns.loc[dt]
-            common = feat_df.index.intersection(fwd.dropna().index)
+            fwd_up = upside_returns.loc[dt]
+            fwd_down = downside_returns.loc[dt]
+            common = feat_df.index.intersection(fwd_up.dropna().index).intersection(
+                fwd_down.dropna().index
+            )
             if len(common) < 10:
                 continue
 
             feat_df = feat_df.loc[common]
-            fwd_common = fwd.loc[common]
-
-            # Label = cross-sectional rank (higher return → higher rank)
-            ranks = fwd_common.rank(ascending=True).values
 
             X_list.append(feat_df.values)
-            y_list.append(ranks)
-            groups.append(len(common))
+            y_up_list.append(fwd_up.loc[common].values)
+            y_down_list.append(fwd_down.loc[common].values)
 
         X = np.vstack(X_list).astype(np.float32)
-        y = np.concatenate(y_list).astype(np.float32)
-        return X, y, np.array(groups)
+        y_up = np.concatenate(y_up_list).astype(np.float32)
+        y_down = np.concatenate(y_down_list).astype(np.float32)
+        return X, y_up, y_down
 
     def train(
         self,
         X: np.ndarray,
-        y: np.ndarray,
-        group: np.ndarray,
+        y_up: np.ndarray,
+        y_down: np.ndarray,
     ):
-        """Fit XGBRanker on pre-built training data."""
+        """Fit dual XGBRegressor on pre-built training data."""
         params = dict(self.cfg.layer2_xgb_params)
-        self.model = XGBRanker(**params)
-        self.model.fit(X, y, group=group)
-        print(f"Layer 2 model trained: {X.shape[0]} samples, {X.shape[1]} features, "
-              f"{len(group)} groups (days)")
+        self.model_upside = XGBRegressor(**params)
+        self.model_downside = XGBRegressor(**params)
+        self.model_upside.fit(X, y_up)
+        print(f"Layer 2 upside model trained: {X.shape[0]} samples, {X.shape[1]} features")
+        self.model_downside.fit(X, y_down)
+        print(f"Layer 2 downside model trained: {X.shape[0]} samples, {X.shape[1]} features")
 
-    def validate(
+    def finetune(
         self,
-        X_val: np.ndarray,
-        y_val: np.ndarray,
-        group_val: np.ndarray,
-    ) -> dict:
-        """Evaluate ranking quality (NDCG-like) on validation set."""
-        from scipy.stats import spearmanr
+        X_new: np.ndarray,
+        y_up_new: np.ndarray,
+        y_down_new: np.ndarray,
+    ):
+        """Warm-start: add trees to both regressors using new quarter's data."""
+        if self.model_upside is None or self.model_downside is None:
+            raise RuntimeError("No base models to fine-tune. Call .train() first.")
 
-        preds = self.model.predict(X_val)
-
-        # Per-group Spearman correlation (proxy for ranking quality)
-        corrs = []
-        offset = 0
-        for g in group_val:
-            if g < 5:
-                offset += g
-                continue
-            p = preds[offset:offset + g]
-            a = y_val[offset:offset + g]
-            c, _ = spearmanr(p, a)
-            corrs.append(c)
-            offset += g
-
-        mean_corr = float(np.mean(corrs)) if corrs else 0.0
-        print(f"Layer 2 validation: mean Spearman rank corr = {mean_corr:.4f} "
-              f"(over {len(corrs)} groups)")
-        return {"mean_rank_corr": mean_corr, "n_groups": len(corrs)}
+        print(f"Layer 2 fine-tune: {X_new.shape[0]} samples, "
+              f"+{self.cfg.finetune_n_estimators} trees @ lr={self.cfg.finetune_learning_rate}")
+        for name, model in [("upside", self.model_upside), ("downside", self.model_downside)]:
+            model.set_params(
+                n_estimators=self.cfg.finetune_n_estimators,
+                learning_rate=self.cfg.finetune_learning_rate,
+            )
+            y_target = y_up_new if name == "upside" else y_down_new
+            model.fit(X_new, y_target, xgb_model=model.get_booster())
+        print("Layer 2 fine-tune complete.")
 
     # ── Inference ────────────────────────────────────────────────────────
 
@@ -272,13 +370,13 @@ class TechnicalRanker:
         date: pd.Timestamp,
         include_news: bool = True,
     ) -> pd.Series:
-        """Rank a set of symbols by predicted forward return.
+        """Rank symbols by composite score = predicted_upside - predicted_downside.
 
         Returns:
             Series indexed by symbol, sorted descending (best first).
         """
-        if self.model is None:
-            raise RuntimeError("Model not trained. Call .train() first.")
+        if self.model_upside is None or self.model_downside is None:
+            raise RuntimeError("Models not trained. Call .train() first.")
 
         feat_df = self.compute_features_for_stocks(
             ohlcv_dict, date=date, symbols=symbols, include_news=include_news
@@ -286,8 +384,11 @@ class TechnicalRanker:
         if feat_df.empty:
             return pd.Series(dtype=float)
 
-        scores = self.model.predict(feat_df.values.astype(np.float32))
-        result = pd.Series(scores, index=feat_df.index, name="rank_score")
+        X = feat_df.values.astype(np.float32)
+        pred_up = self.model_upside.predict(X)
+        pred_down = self.model_downside.predict(X)
+        composite = pred_up - pred_down
+        result = pd.Series(composite, index=feat_df.index, name="rank_score")
         return result.sort_values(ascending=False)
 
     def select_top(
@@ -307,12 +408,16 @@ class TechnicalRanker:
         path = path or os.path.join(self.cfg.model_cache, "layer2_technical_ranker.pkl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"model": self.model}, f)
-        print(f"Layer 2 model saved → {path}")
+            pickle.dump({
+                "model_upside": self.model_upside,
+                "model_downside": self.model_downside,
+            }, f)
+        print(f"Layer 2 models saved → {path}")
 
     def load(self, path: str | None = None):
         path = path or os.path.join(self.cfg.model_cache, "layer2_technical_ranker.pkl")
         with open(path, "rb") as f:
             data = pickle.load(f)
-        self.model = data["model"]
-        print(f"Layer 2 model loaded ← {path}")
+        self.model_upside = data["model_upside"]
+        self.model_downside = data["model_downside"]
+        print(f"Layer 2 models loaded ← {path}")

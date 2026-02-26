@@ -16,10 +16,12 @@ from sklearn.multioutput import MultiOutputRegressor
 from xgboost import XGBRegressor
 
 from screener.config import ScreenerConfig
-from screener.utils import FACTOR_CATEGORIES, robust_zscore, group_features_by_category
+from screener.utils import FACTOR_CATEGORIES, robust_zscore, group_features_by_category, compute_daily_category_ic
 from screener.data_pipeline import (
     load_alpha158_factors,
     load_alpha158_labels,
+    load_alpha158_year,
+    alpha158_year_range,
     load_market_regime_features,
     compute_lagged_factor_ic,
 )
@@ -41,28 +43,63 @@ class FactorTimingModel:
         self,
         alpha158_df: pd.DataFrame | None = None,
         regime_df: pd.DataFrame | None = None,
+        train_start: str | None = None,
+        train_end: str | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Build (X, Y) where each row is one trading day.
 
         X: regime features + lagged factor IC  (~60 dims)
         Y: forward IC per factor category      (~10 dims)
+
+        When alpha158_df is None, processes year-by-year to limit memory.
+        train_start/train_end scope the data range (defaults to cfg values).
         """
+        import gc
+
         cfg = self.cfg
-        if alpha158_df is None:
-            alpha158_df = load_alpha158_factors(cfg, cfg.train_start, cfg.backtest_end)
-        self._alpha158_df = alpha158_df
+        ts_start = train_start or cfg.train_start
+        ts_end = train_end or cfg.train_end
 
         if regime_df is None:
-            regime_df = load_market_regime_features(cfg, cfg.train_start, cfg.backtest_end)
+            regime_df = load_market_regime_features(cfg, ts_start, ts_end)
 
-        # Compute forward returns (5-day) for IC labels
-        labels = load_alpha158_labels(cfg, cfg.train_start, cfg.backtest_end)
+        if alpha158_df is not None:
+            # Direct path: data already in memory — slice to window
+            self._alpha158_df = alpha158_df
+            labels = load_alpha158_labels(cfg, ts_start, ts_end)
+            dt_idx = alpha158_df.index.get_level_values("datetime")
+            mask = (dt_idx >= pd.Timestamp(ts_start)) & (dt_idx <= pd.Timestamp(ts_end))
+            windowed = alpha158_df.loc[mask]
+            lagged_ic = compute_lagged_factor_ic(windowed, labels, lookback=20)
+            fwd_ic = self._compute_forward_ic(windowed, labels)
+        else:
+            # Year-by-year path: only iterate years in [train_start, train_end]
+            start_year = pd.Timestamp(ts_start).year
+            end_year = pd.Timestamp(ts_end).year
+            print(f"  Computing IC values year-by-year ({start_year}–{end_year})…")
+            lagged_ic_parts = []
+            fwd_ic_parts = []
+            for year in range(start_year, end_year + 1):
+                print(f"    {year}…", end=" ", flush=True)
+                year_df = load_alpha158_year(cfg, year)
+                if year_df.empty:
+                    print("(skip)")
+                    continue
+                year_labels = load_alpha158_labels(
+                    cfg, f"{year}-01-01", f"{year}-12-31"
+                )
+                lagged_ic_parts.append(
+                    compute_lagged_factor_ic(year_df, year_labels, lookback=20)
+                )
+                fwd_ic_parts.append(self._compute_forward_ic(year_df, year_labels))
+                print(f"{len(year_df)} rows")
+                del year_df, year_labels
+                gc.collect()
 
-        # Lagged IC (trailing 20-day rolling IC per category)
-        lagged_ic = compute_lagged_factor_ic(alpha158_df, labels, lookback=20)
-
-        # Forward IC: per-day Spearman(category_mean_score, actual_forward_return)
-        fwd_ic = self._compute_forward_ic(alpha158_df, labels)
+            lagged_ic = pd.concat(lagged_ic_parts)
+            fwd_ic = pd.concat(fwd_ic_parts)
+            del lagged_ic_parts, fwd_ic_parts
+            gc.collect()
 
         # Merge X
         X = regime_df.join(lagged_ic, how="inner")
@@ -76,45 +113,34 @@ class FactorTimingModel:
         self, alpha158_df: pd.DataFrame, returns: pd.Series
     ) -> pd.DataFrame:
         """Compute daily forward IC per factor category (the label for training)."""
-        feature_groups = group_features_by_category(list(alpha158_df.columns))
-        dates = sorted(alpha158_df.index.get_level_values("datetime").unique())
-
-        records = []
-        for dt in dates:
-            row = {"datetime": dt}
-            try:
-                day_f = alpha158_df.xs(dt, level="datetime")
-                day_r = returns.xs(dt, level="datetime") if isinstance(returns.index, pd.MultiIndex) else returns.loc[dt]
-            except KeyError:
-                continue
-            for cat in FACTOR_CATEGORIES:
-                feats = feature_groups.get(cat, [])
-                if not feats:
-                    row[f"fwd_ic_{cat}"] = 0.0
-                    continue
-                cat_score = day_f[feats].mean(axis=1)
-                valid = pd.DataFrame({"s": cat_score, "r": day_r}).dropna()
-                if len(valid) < 10:
-                    row[f"fwd_ic_{cat}"] = 0.0
-                else:
-                    row[f"fwd_ic_{cat}"] = valid["s"].corr(valid["r"], method="spearman")
-            records.append(row)
-
-        return pd.DataFrame(records).set_index("datetime")
+        ic_df = compute_daily_category_ic(alpha158_df, returns, min_valid=10)
+        ic_df = ic_df.rename(columns={c: f"fwd_ic_{c}" for c in ic_df.columns})
+        return ic_df.fillna(0.0)
 
     def train(
         self,
         X: pd.DataFrame | None = None,
         Y: pd.DataFrame | None = None,
+        train_start: str | None = None,
         train_end: str | None = None,
     ):
         """Fit the multi-output XGBoost model on training period."""
         if X is None or Y is None:
-            X, Y = self.build_training_data()
+            X, Y = self.build_training_data(train_start=train_start, train_end=train_end)
 
-        train_end = pd.Timestamp(train_end or self.cfg.train_end)
-        mask = X.index <= train_end
+        ts_start = pd.Timestamp(train_start or self.cfg.train_start)
+        ts_end = pd.Timestamp(train_end or self.cfg.train_end)
+        mask = (X.index >= ts_start) & (X.index <= ts_end)
         X_train, Y_train = X.loc[mask], Y.loc[mask]
+
+        # Leakage trim: drop last N rows whose forward-return labels
+        # peek past train_end into the test period
+        trim = self.cfg.forward_horizon_days
+        if len(X_train) > trim:
+            X_train = X_train.iloc[:-trim]
+            Y_train = Y_train.iloc[:-trim]
+            print(f"  Leakage trim: dropped last {trim} days")
+
         print(f"Layer 1 training: {len(X_train)} days, {len(self.feature_names)} features, "
               f"{len(self.target_names)} targets")
 
@@ -122,6 +148,35 @@ class FactorTimingModel:
         self.model = MultiOutputRegressor(base)
         self.model.fit(X_train.values, Y_train.values)
         print("Layer 1 model trained.")
+
+    def finetune(self, X_new: pd.DataFrame, Y_new: pd.DataFrame):
+        """Warm-start: add trees to existing model using new data.
+
+        Uses fewer trees and lower learning rate for conservative adaptation.
+        """
+        if self.model is None:
+            raise RuntimeError("No base model to fine-tune. Call .train() first.")
+
+        # Leakage trim
+        trim = self.cfg.forward_horizon_days
+        if len(X_new) > trim:
+            X_new = X_new.iloc[:-trim]
+            Y_new = Y_new.iloc[:-trim]
+            print(f"  Leakage trim: dropped last {trim} days")
+
+        print(f"Layer 1 fine-tune: {len(X_new)} days, "
+              f"+{self.cfg.finetune_n_estimators} trees @ lr={self.cfg.finetune_learning_rate}")
+
+        for i, est in enumerate(self.model.estimators_):
+            est.set_params(
+                n_estimators=self.cfg.finetune_n_estimators,
+                learning_rate=self.cfg.finetune_learning_rate,
+            )
+            est.fit(
+                X_new.values, Y_new.iloc[:, i].values,
+                xgb_model=est.get_booster(),
+            )
+        print("Layer 1 fine-tune complete.")
 
     def validate(self, X: pd.DataFrame, Y: pd.DataFrame, val_start: str, val_end: str) -> dict:
         """Evaluate predicted IC vs actual forward IC on validation set."""
@@ -162,8 +217,15 @@ class FactorTimingModel:
         if alpha158_df is None:
             alpha158_df = self._alpha158_df
         if alpha158_df is None:
-            alpha158_df = load_alpha158_factors(self.cfg)
+            # Load only the needed year to save memory
+            alpha158_df = load_alpha158_year(self.cfg, date.year)
             self._alpha158_df = alpha158_df
+            self._alpha158_year = date.year
+        elif hasattr(self, "_alpha158_year") and self._alpha158_year != date.year:
+            # Year changed, reload
+            alpha158_df = load_alpha158_year(self.cfg, date.year)
+            self._alpha158_df = alpha158_df
+            self._alpha158_year = date.year
 
         # Get regime features for this date
         if regime_row is None:

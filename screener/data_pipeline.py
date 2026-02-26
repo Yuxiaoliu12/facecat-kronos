@@ -1,9 +1,9 @@
 """
-Data pipeline: Qlib init, Alpha158 factor computation, regime features, raw OHLCV.
+Data pipeline: Alpha158 factor computation, regime features, raw OHLCV.
 
-Follows the same Qlib patterns as ``finetune/qlib_data_preprocess.py``.
-Alpha158 features are computed directly via D.features() with Qlib expressions,
-bypassing the Alpha158 handler which has compatibility issues across Qlib versions.
+All data sourced from local pickle files (baostock format, no Qlib).
+OHLCV pickle: Dict[str, DataFrame] keyed by baostock symbol (e.g. 'sh.600000').
+Benchmark pickle: single DataFrame indexed by date.
 """
 
 import os
@@ -11,170 +11,273 @@ import pickle
 
 import numpy as np
 import pandas as pd
-import qlib
-from qlib.config import REG_CN
-from qlib.data import D
-from qlib.data.dataset.loader import QlibDataLoader
 
 from screener.config import ScreenerConfig
 from screener.utils import (
     calendar_features_series,
+    compute_daily_category_ic,
     group_features_by_category,
     FACTOR_CATEGORIES,
     robust_zscore,
 )
 
 
-# ── Qlib Initialisation ─────────────────────────────────────────────────────
+# ── Module-level data cache ──────────────────────────────────────────────────
 
-def init_qlib(cfg: ScreenerConfig | None = None):
-    """Initialise Qlib (idempotent — safe to call multiple times)."""
-    _patch_qlib_parallel()
+_ohlcv_cache: dict[str, pd.DataFrame] | None = None
+_benchmark_cache: pd.DataFrame | None = None
+
+
+def init_data(cfg: ScreenerConfig | None = None):
+    """Load pickle data into module cache (idempotent)."""
+    global _ohlcv_cache, _benchmark_cache
     cfg = cfg or ScreenerConfig()
-    provider = os.path.expanduser(cfg.qlib_data_path)
-    qlib.init(provider_uri=provider, region=REG_CN)
+
+    if _ohlcv_cache is None:
+        print(f"Loading OHLCV pickle: {cfg.ohlcv_pickle_path}")
+        raw = pd.read_pickle(cfg.ohlcv_pickle_path)
+        # Convert to float32 to halve memory (~670 MB → ~335 MB)
+        _ohlcv_cache = {
+            sym: df.astype(np.float32) for sym, df in raw.items()
+        }
+        del raw
+        print(f"  {len(_ohlcv_cache)} stocks loaded (float32).")
+
+    if _benchmark_cache is None:
+        print(f"Loading benchmark pickle: {cfg.benchmark_pickle_path}")
+        _benchmark_cache = pd.read_pickle(cfg.benchmark_pickle_path)
+        print(f"  {len(_benchmark_cache)} trading days loaded.")
 
 
-def _patch_qlib_parallel():
-    """Fix ParallelExt._backend_args AttributeError in newer joblib versions."""
-    try:
-        import qlib.utils.paral as _paral
-        _orig_init = _paral.ParallelExt.__init__
-
-        def _patched_init(self, *args, **kwargs):
-            try:
-                _orig_init(self, *args, **kwargs)
-            except AttributeError:
-                # _backend_args was removed in newer joblib; skip maxtasksperchild
-                pass
-
-        _paral.ParallelExt.__init__ = _patched_init
-    except Exception:
-        pass
+def _get_ohlcv_cache(cfg: ScreenerConfig) -> dict[str, pd.DataFrame]:
+    global _ohlcv_cache
+    if _ohlcv_cache is None:
+        init_data(cfg)
+    return _ohlcv_cache
 
 
-def _qlib_features(instruments, fields, start_time=None, end_time=None, freq="day"):
-    """Replacement for D.features() that avoids the inst_processors bug.
+def _get_benchmark_cache(cfg: ScreenerConfig) -> pd.DataFrame:
+    global _benchmark_cache
+    if _benchmark_cache is None:
+        init_data(cfg)
+    return _benchmark_cache
 
-    Qlib's D.features() passes inst_processors both positionally and as keyword
-    to DatasetD.dataset(), causing a TypeError. This function calls the provider
-    directly using keyword-only arguments to avoid the parameter order conflict.
+
+# ── Calendar helpers ─────────────────────────────────────────────────────────
+
+def get_calendar(cfg: ScreenerConfig, start: str, end: str) -> pd.DatetimeIndex:
+    """Return trading-day calendar between start and end (inclusive)."""
+    bench = _get_benchmark_cache(cfg)
+    mask = (bench.index >= pd.Timestamp(start)) & (bench.index <= pd.Timestamp(end))
+    return pd.DatetimeIndex(bench.index[mask])
+
+
+def get_full_calendar(cfg: ScreenerConfig) -> pd.DatetimeIndex:
+    """Return full trading-day calendar from benchmark data."""
+    bench = _get_benchmark_cache(cfg)
+    return pd.DatetimeIndex(bench.index)
+
+
+# ── Alpha158-equivalent features (pure pandas) ──────────────────────────────
+
+def _compute_alpha158_single(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute ~109 Alpha158-equivalent features for one stock's OHLCV.
+
+    Args:
+        df: DataFrame with columns [open, high, low, close, volume, amount],
+            indexed by date.
+
+    Returns:
+        DataFrame with 109 feature columns, same date index.
     """
-    from qlib.data.data import DatasetD
-    return DatasetD.dataset(
-        instruments=instruments,
-        fields=fields,
-        start_time=start_time,
-        end_time=end_time,
-        freq=freq,
-    )
+    o = df["open"]
+    h = df["high"]
+    lo = df["low"]
+    c = df["close"]
+    v = df["volume"]
 
-
-def _resolve_instruments(cfg: ScreenerConfig, start: str, end: str) -> list[str]:
-    """Read instrument list from Qlib data files directly.
-
-    Bypasses D.instruments() / DatasetProvider.dataset() which has
-    inst_processors compatibility issues in newer Qlib versions.
-    """
-    data_dir = os.path.expanduser(cfg.qlib_data_path)
-    inst_file = os.path.join(data_dir, "instruments", f"{cfg.universe}.txt")
-
-    symbols = []
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-
-    with open(inst_file, "r") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 3:
-                sym = parts[0]
-                sym_start = pd.Timestamp(parts[1])
-                sym_end = pd.Timestamp(parts[2])
-                if sym_start <= end_ts and sym_end >= start_ts:
-                    symbols.append(sym)
-            elif len(parts) >= 1 and parts[0]:
-                symbols.append(parts[0])
-
-    print(f"Resolved {len(symbols)} instruments from {inst_file}")
-    return symbols
-
-
-# ── Alpha158-equivalent features via D.features() ──────────────────────────
-
-def _alpha158_exprs() -> tuple[list[str], list[str]]:
-    """Return (expressions, names) for Alpha158-equivalent features.
-
-    Produces ~109 features covering all Alpha158 categories:
-    momentum, trend, volatility, price_extreme, mean_reversion,
-    correlation, volume_price, volume, cross_section.
-    """
-    exprs = []
-    names = []
+    features = {}
 
     # KBAR features (9)
-    kbar = [
-        ("($close-$open)/$open", "KMID$0"),
-        ("($high-$low)/$open", "KLEN$0"),
-        ("($close-$open)/($high-$low+1e-12)", "KMID2$0"),
-        ("($high-Greater($open,$close))/$open", "KUP$0"),
-        ("($high-Greater($open,$close))/($high-$low+1e-12)", "KUP2$0"),
-        ("(Less($open,$close)-$low)/$open", "KLOW$0"),
-        ("(Less($open,$close)-$low)/($high-$low+1e-12)", "KLOW2$0"),
-        ("(2*$close-$high-$low)/$open", "KSFT$0"),
-        ("(2*$close-$high-$low)/($high-$low+1e-12)", "KSFT2$0"),
-    ]
-    for expr, name in kbar:
-        exprs.append(expr)
-        names.append(name)
+    features["KMID$0"] = (c - o) / o
+    features["KLEN$0"] = (h - lo) / o
+    features["KMID2$0"] = (c - o) / (h - lo + 1e-12)
+    features["KUP$0"] = (h - np.maximum(o, c)) / o
+    features["KUP2$0"] = (h - np.maximum(o, c)) / (h - lo + 1e-12)
+    features["KLOW$0"] = (np.minimum(o, c) - lo) / o
+    features["KLOW2$0"] = (np.minimum(o, c) - lo) / (h - lo + 1e-12)
+    features["KSFT$0"] = (2 * c - h - lo) / o
+    features["KSFT2$0"] = (2 * c - h - lo) / (h - lo + 1e-12)
 
-    # Rolling features for windows [5, 10, 20, 30, 60]
+    # Pre-compute daily return and log volume ratio for rolling features
+    prev_c = c.shift(1)
+    daily_ret = c / prev_c
+    abs_ret = (c - prev_c).abs()
+    log_v = np.log(v + 1)
+    log_v_ratio = np.log(v / v.shift(1).replace(0, np.nan) + 1)
+    up = (c > prev_c).astype(float)
+    down = (c < prev_c).astype(float)
+    gain = np.maximum(c - prev_c, 0)
+    loss = np.maximum(prev_c - c, 0)
+
     for N in [5, 10, 20, 30, 60]:
-        rolling = [
-            # momentum / trend
-            (f"Ref($close,{N})/$close", f"ROC${N}"),
-            (f"Mean($close,{N})/$close", f"MA${N}"),
-            # volatility
-            (f"Std($close,{N})/$close", f"STD${N}"),
-            # price_extreme
-            (f"Max($high,{N})/$close", f"MAX${N}"),
-            (f"Min($low,{N})/$close", f"MIN${N}"),
-            # mean_reversion
-            (f"($close-Min($low,{N}))/(Max($high,{N})-Min($low,{N})+1e-12)", f"RSV${N}"),
-            # correlation
-            (f"Corr($close,Log($volume+1),{N})", f"CORR${N}"),
-            (f"Corr($close/Ref($close,1),Log($volume/Ref($volume,1)+1),{N})", f"CORD${N}"),
-            # volume_price
-            (f"Mean($close>Ref($close,1),{N})", f"CNTP${N}"),
-            (f"Mean($close<Ref($close,1),{N})", f"CNTN${N}"),
-            (f"Mean($close>Ref($close,1),{N})-Mean($close<Ref($close,1),{N})", f"CNTD${N}"),
-            (f"Sum(Greater($close-Ref($close,1),0),{N})/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)", f"SUMP${N}"),
-            (f"Sum(Greater(Ref($close,1)-$close,0),{N})/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)", f"SUMN${N}"),
-            (
-                f"(Sum(Greater($close-Ref($close,1),0),{N})-Sum(Greater(Ref($close,1)-$close,0),{N}))"
-                f"/(Sum(Abs($close-Ref($close,1)),{N})+1e-12)",
-                f"SUMD${N}",
-            ),
-            # volume
-            (f"Mean($volume,{N})/($volume+1e-12)", f"VMA${N}"),
-            (f"Std($volume,{N})/($volume+1e-12)", f"VSTD${N}"),
-            (
-                f"Std(Abs($close/Ref($close,1)-1)*$volume,{N})"
-                f"/(Mean(Abs($close/Ref($close,1)-1)*$volume,{N})+1e-12)",
-                f"WVMA${N}",
-            ),
-            (f"Sum(If($close>Ref($close,1),$volume,0),{N})/(Sum($volume,{N})+1e-12)", f"VSUMP${N}"),
-            (f"Sum(If($close<Ref($close,1),$volume,0),{N})/(Sum($volume,{N})+1e-12)", f"VSUMN${N}"),
-            (
-                f"(Sum(If($close>Ref($close,1),$volume,0),{N})-Sum(If($close<Ref($close,1),$volume,0),{N}))"
-                f"/(Sum($volume,{N})+1e-12)",
-                f"VSUMD${N}",
-            ),
-        ]
-        for expr, name in rolling:
-            exprs.append(expr)
-            names.append(name)
+        # momentum / trend
+        features[f"ROC${N}"] = c.shift(N) / c
+        features[f"MA${N}"] = c.rolling(N).mean() / c
 
-    return exprs, names
+        # volatility
+        features[f"STD${N}"] = c.rolling(N).std() / c
+
+        # price extremes
+        features[f"MAX${N}"] = h.rolling(N).max() / c
+        features[f"MIN${N}"] = lo.rolling(N).min() / c
+
+        # mean reversion (RSV)
+        roll_max = h.rolling(N).max()
+        roll_min = lo.rolling(N).min()
+        features[f"RSV${N}"] = (c - roll_min) / (roll_max - roll_min + 1e-12)
+
+        # correlation
+        features[f"CORR${N}"] = c.rolling(N).corr(log_v)
+        features[f"CORD${N}"] = (c / prev_c).rolling(N).corr(log_v_ratio)
+
+        # volume-price counts
+        features[f"CNTP${N}"] = up.rolling(N).mean()
+        features[f"CNTN${N}"] = down.rolling(N).mean()
+        features[f"CNTD${N}"] = features[f"CNTP${N}"] - features[f"CNTN${N}"]
+
+        # sum positive / negative
+        sum_abs = abs_ret.rolling(N).sum()
+        features[f"SUMP${N}"] = gain.rolling(N).sum() / (sum_abs + 1e-12)
+        features[f"SUMN${N}"] = loss.rolling(N).sum() / (sum_abs + 1e-12)
+        features[f"SUMD${N}"] = features[f"SUMP${N}"] - features[f"SUMN${N}"]
+
+        # volume features
+        features[f"VMA${N}"] = v.rolling(N).mean() / (v + 1e-12)
+        features[f"VSTD${N}"] = v.rolling(N).std() / (v + 1e-12)
+
+        # WVMA: weighted volume-price volatility
+        wv = (c / prev_c - 1).abs() * v
+        features[f"WVMA${N}"] = wv.rolling(N).std() / (wv.rolling(N).mean() + 1e-12)
+
+        # volume split by direction
+        vol_up = (up * v).rolling(N).sum()
+        vol_down = (down * v).rolling(N).sum()
+        vol_sum = v.rolling(N).sum()
+        features[f"VSUMP${N}"] = vol_up / (vol_sum + 1e-12)
+        features[f"VSUMN${N}"] = vol_down / (vol_sum + 1e-12)
+        features[f"VSUMD${N}"] = features[f"VSUMP${N}"] - features[f"VSUMN${N}"]
+
+    return pd.DataFrame(features, index=df.index).astype(np.float32)
+
+
+def _cs_robust_zscore(group, clip=3.0):
+    median = group.median()
+    mad = (group - median).abs().median()
+    return ((group - median) / (1.4826 * mad + 1e-9)).clip(-clip, clip)
+
+
+_SUBBATCH = 500
+
+
+def _compute_year_chunk(
+    ohlcv: dict[str, pd.DataFrame],
+    year_start: pd.Timestamp,
+    year_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Compute Alpha158 features for one year, cross-sectionally normalised.
+
+    Processes stocks in sub-batches to limit peak memory.
+    """
+    import gc
+
+    lookback_start = year_start - pd.Timedelta(days=120)
+
+    # Build sub-batches: compute features for _SUBBATCH stocks at a time,
+    # immediately concat and free the per-stock frames.
+    merged = []
+    batch = []
+    for sym, sdf in ohlcv.items():
+        sdf_slice = sdf.loc[sdf.index >= lookback_start]
+        if len(sdf_slice) < 65:
+            continue
+        feat = _compute_alpha158_single(sdf_slice)
+        feat = feat.loc[(feat.index >= year_start) & (feat.index <= year_end)]
+        if feat.empty:
+            continue
+        feat["instrument"] = sym
+        batch.append(feat)
+
+        if len(batch) >= _SUBBATCH:
+            sub = pd.concat(batch)
+            sub = sub.set_index("instrument", append=True)
+            merged.append(sub)
+            batch = []
+
+    if batch:
+        sub = pd.concat(batch)
+        sub = sub.set_index("instrument", append=True)
+        merged.append(sub)
+        batch = []
+
+    if not merged:
+        return pd.DataFrame()
+
+    df = pd.concat(merged)
+    del merged
+    gc.collect()
+
+    df.index.names = ["datetime", "instrument"]
+
+    # Cross-sectional RobustZScore normalisation per day
+    # Manual loop avoids huge intermediate copies from groupby().transform()
+    import warnings
+    dates = df.index.get_level_values("datetime").unique()
+    for dt in dates:
+        mask = df.index.get_level_values("datetime") == dt
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            df.loc[mask] = _cs_robust_zscore(df.loc[mask])
+    df = df.fillna(0)
+    return df
+
+
+def _alpha158_year_path(cfg: ScreenerConfig, year: int) -> str:
+    """Path to a single year's Alpha158 cache file."""
+    cache_dir = os.path.dirname(cfg.alpha158_cache) or "."
+    return os.path.join(cache_dir, f"_alpha158_chunk_{year}.pkl")
+
+
+def _ensure_alpha158_years(cfg: ScreenerConfig, start_year: int, end_year: int):
+    """Compute and cache Alpha158 for any missing years in [start_year, end_year]."""
+    import gc
+
+    ohlcv = _get_ohlcv_cache(cfg)
+    cache_dir = os.path.dirname(cfg.alpha158_cache) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+
+    for year in range(start_year, end_year + 1):
+        path = _alpha158_year_path(cfg, year)
+        if os.path.exists(path):
+            continue
+
+        y_start = pd.Timestamp(f"{year}-01-01")
+        y_end = pd.Timestamp(f"{year}-12-31")
+
+        print(f"  {year}: computing…", end=" ", flush=True)
+        chunk = _compute_year_chunk(ohlcv, y_start, y_end)
+
+        if chunk.empty:
+            print("(no data)")
+            continue
+
+        n_stocks = chunk.index.get_level_values("instrument").nunique()
+        n_dates = chunk.index.get_level_values("datetime").nunique()
+        print(f"{n_stocks} stocks × {n_dates} days")
+
+        chunk.to_pickle(path)
+        del chunk
+        gc.collect()
 
 
 def load_alpha158_factors(
@@ -184,48 +287,60 @@ def load_alpha158_factors(
     *,
     cache: bool = True,
 ) -> pd.DataFrame:
-    """Load Alpha158-equivalent cross-sectional factors for the whole universe.
+    """Load Alpha158 factors for the requested date range.
 
-    Returns a DataFrame with MultiIndex (datetime, instrument) and ~109 factor
-    columns.  Results are cached to ``cfg.alpha158_cache`` on first call.
+    Uses yearly cache files (~300-500 MB each) and only loads the years
+    that overlap with [start, end].  If loading the full 2015-2026 range
+    would exceed memory, use load_alpha158_year() to iterate year-by-year.
     """
+    import gc
+
     start = start or cfg.train_start
     end = end or cfg.backtest_end
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    start_year = start_ts.year
+    end_year = end_ts.year
 
-    # Try cache first
-    if cache and os.path.exists(cfg.alpha158_cache):
-        print(f"Loading Alpha158 from cache: {cfg.alpha158_cache}")
-        df = pd.read_pickle(cfg.alpha158_cache)
-        mask = (df.index.get_level_values("datetime") >= pd.Timestamp(start)) & (
-            df.index.get_level_values("datetime") <= pd.Timestamp(end)
-        )
-        return df.loc[mask]
+    # Ensure all needed year files exist
+    _ensure_alpha158_years(cfg, start_year, end_year)
 
-    print("Computing Alpha158 factors via D.features() (this may take a few minutes)…")
-    exprs, feat_names = _alpha158_exprs()
-    symbols = _resolve_instruments(cfg, start, end)
+    # Load only the needed years
+    chunks = []
+    for year in range(start_year, end_year + 1):
+        path = _alpha158_year_path(cfg, year)
+        if os.path.exists(path):
+            chunks.append(pd.read_pickle(path))
 
-    df = _qlib_features(symbols, exprs, start_time=start, end_time=end, freq="day")
-    df.columns = feat_names
+    if not chunks:
+        return pd.DataFrame()
 
-    # Cross-sectional RobustZScore normalisation per day
-    print("Applying cross-sectional RobustZScore normalisation…")
+    df = pd.concat(chunks)
+    del chunks
+    gc.collect()
 
-    def _cs_robust_zscore(group, clip=3.0):
-        median = group.median()
-        mad = (group - median).abs().median()
-        return ((group - median) / (1.4826 * mad + 1e-9)).clip(-clip, clip)
+    # Trim to exact date range
+    mask = (df.index.get_level_values("datetime") >= start_ts) & (
+        df.index.get_level_values("datetime") <= end_ts
+    )
+    return df.loc[mask]
 
-    df = df.groupby(level="datetime").transform(_cs_robust_zscore)
-    df = df.fillna(0)
 
-    # Persist
-    if cache:
-        os.makedirs(os.path.dirname(cfg.alpha158_cache), exist_ok=True)
-        df.to_pickle(cfg.alpha158_cache)
-        print(f"Alpha158 cached → {cfg.alpha158_cache}")
+def load_alpha158_year(cfg: ScreenerConfig, year: int) -> pd.DataFrame:
+    """Load a single year's Alpha158 data. Memory-efficient for iteration."""
+    _ensure_alpha158_years(cfg, year, year)
+    path = _alpha158_year_path(cfg, year)
+    if os.path.exists(path):
+        return pd.read_pickle(path)
+    return pd.DataFrame()
 
-    return df
+
+def alpha158_year_range(cfg: ScreenerConfig) -> range:
+    """Return the year range covered by the config."""
+    return range(
+        pd.Timestamp(cfg.train_start).year,
+        pd.Timestamp(cfg.backtest_end).year + 1,
+    )
 
 
 def load_alpha158_labels(
@@ -236,21 +351,34 @@ def load_alpha158_labels(
     """Load forward return labels (CSRankNorm'd)."""
     start = start or cfg.train_start
     end = end or cfg.backtest_end
-
-    # Load close prices
-    symbols = _resolve_instruments(cfg, start, end)
-    close_df = _qlib_features(symbols, ["$close"], start_time=start, end_time=end, freq="day")
-    close_df.columns = ["close"]
-
-    # Forward N-day return per stock
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
     fwd = cfg.layer1_forward_days
-    fwd_ret = close_df.groupby(level="instrument")["close"].transform(
-        lambda x: x.shift(-fwd) / x - 1
-    )
-    fwd_ret = fwd_ret.dropna()
+
+    ohlcv = _get_ohlcv_cache(cfg)
+
+    pieces = []
+    for sym, sdf in ohlcv.items():
+        close = sdf["close"]
+        high = sdf["high"]
+        # Forward max-high return over [t+1, t+fwd]
+        fwd_max_high = high[::-1].rolling(fwd, min_periods=fwd).max()[::-1].shift(-1)
+        fwd_ret = fwd_max_high / close - 1
+        fwd_ret = fwd_ret.loc[(fwd_ret.index >= start_ts) & (fwd_ret.index <= end_ts)]
+        fwd_ret = fwd_ret.dropna()
+        if fwd_ret.empty:
+            continue
+        fwd_ret_df = fwd_ret.to_frame("label")
+        fwd_ret_df["instrument"] = sym
+        pieces.append(fwd_ret_df)
+
+    df = pd.concat(pieces)
+    df = df.set_index("instrument", append=True)
+    df.index.names = ["datetime", "instrument"]
+    labels = df["label"]
 
     # Cross-sectional rank normalisation per day (centre around 0)
-    labels = fwd_ret.groupby(level="datetime").transform(
+    labels = labels.groupby(level="datetime").transform(
         lambda g: g.rank(pct=True) - 0.5
     )
     return labels
@@ -268,44 +396,33 @@ def load_market_regime_features(
     Features (~40-60 dims):
       - Calendar (5): month, quarter, day_of_week, day_of_month, days_to_quarter_end
       - Market (3): 20d index return, 20d volatility, market breadth
-      - Sector (≤28): 20d return per ShenWan L1 sector
+      - Sector (≤28): 20d return per code-prefix grouping
       - Lagged factor IC (≤10): rolling IC per factor category over past 20d
     """
     start = start or cfg.train_start
     end = end or cfg.backtest_end
 
-    # Calendar → trading day calendar from Qlib
-    cal = D.calendar(start_time=start, end_time=end)
-    cal_idx = pd.DatetimeIndex(cal)
+    cal_idx = get_calendar(cfg, start, end)
     cal_df = calendar_features_series(cal_idx)
 
-    # Market-level features from benchmark index
-    benchmark = cfg.benchmark
-    index_fields = ["$close", "$open", "$high", "$low", "$volume"]
-    idx_df = _qlib_features(
-        [benchmark], index_fields, start_time=start, end_time=end, freq="day"
-    )
-    # Flatten MultiIndex
-    if isinstance(idx_df.index, pd.MultiIndex):
-        idx_df = idx_df.droplevel("instrument")
-    idx_df.columns = ["idx_close", "idx_open", "idx_high", "idx_low", "idx_volume"]
+    # Market-level features from benchmark
+    bench = _get_benchmark_cache(cfg)
+    idx_close = bench["close"]
 
     market = pd.DataFrame(index=cal_idx)
-    market["idx_ret_20d"] = idx_df["idx_close"].pct_change(20)
-    market["idx_vol_20d"] = idx_df["idx_close"].pct_change().rolling(20).std()
+    market["idx_ret_20d"] = idx_close.pct_change(20).reindex(cal_idx)
+    market["idx_vol_20d"] = idx_close.pct_change().rolling(20).std().reindex(cal_idx)
 
     # Market breadth: % of stocks above their 20-day MA
-    # (computed from universe close prices)
     breadth = _compute_market_breadth(cfg, start, end, cal_idx)
     market["market_breadth"] = breadth
 
-    # Sector returns (ShenWan L1 — we proxy via the $close of sector ETFs or
-    # compute sector-mean returns from stock data).
+    # Sector returns
     sector_df = _compute_sector_returns(cfg, start, end, cal_idx)
 
     # Merge everything
     regime = cal_df.join(market, how="left").join(sector_df, how="left")
-    regime = regime.fillna(method="ffill").fillna(0)
+    regime = regime.ffill().fillna(0)
     return regime
 
 
@@ -313,54 +430,54 @@ def _compute_market_breadth(
     cfg: ScreenerConfig, start: str, end: str, cal_idx: pd.DatetimeIndex
 ) -> pd.Series:
     """Fraction of universe stocks whose close > MA20."""
-    close_fields = ["$close"]
-    symbols = _resolve_instruments(cfg, start, end)
-    close_df = _qlib_features(
-        symbols, close_fields, start_time=start, end_time=end, freq="day"
-    )
-    close_df.columns = ["close"]
+    ohlcv = _get_ohlcv_cache(cfg)
+    start_ts = pd.Timestamp(start) - pd.Timedelta(days=40)  # lookback for MA20
+    end_ts = pd.Timestamp(end)
 
-    # Compute per-stock MA20 then compare
-    close_unstacked = close_df["close"].unstack("instrument")
-    ma20 = close_unstacked.rolling(20).mean()
-    above = (close_unstacked > ma20).mean(axis=1)  # fraction above
-    above = above.reindex(cal_idx)
-    return above
+    close_dict = {}
+    for sym, sdf in ohlcv.items():
+        s = sdf["close"].loc[(sdf.index >= start_ts) & (sdf.index <= end_ts)]
+        if len(s) >= 20:
+            close_dict[sym] = s
+
+    close_df = pd.DataFrame(close_dict)
+    ma20 = close_df.rolling(20).mean()
+    above = (close_df > ma20).mean(axis=1)
+    return above.reindex(cal_idx)
 
 
 def _compute_sector_returns(
     cfg: ScreenerConfig, start: str, end: str, cal_idx: pd.DatetimeIndex
 ) -> pd.DataFrame:
-    """Compute 20-day returns for ShenWan L1 sectors.
+    """Compute 20-day returns grouped by code prefix as a sector proxy."""
+    ohlcv = _get_ohlcv_cache(cfg)
+    start_ts = pd.Timestamp(start) - pd.Timedelta(days=40)
+    end_ts = pd.Timestamp(end)
 
-    Since Qlib doesn't natively provide sector classification, we use a simple
-    proxy: compute the equal-weight 20-day return for each exchange-board
-    grouping (by code prefix).
-    """
-    symbols = _resolve_instruments(cfg, start, end)
-    close_df = _qlib_features(
-        symbols, ["$close"], start_time=start, end_time=end, freq="day"
-    )
-    close_df.columns = ["close"]
-    close_unstacked = close_df["close"].unstack("instrument")
+    close_dict = {}
+    for sym, sdf in ohlcv.items():
+        s = sdf["close"].loc[(sdf.index >= start_ts) & (sdf.index <= end_ts)]
+        if len(s) >= 20:
+            close_dict[sym] = s
 
-    # Group stocks by code prefix (first 3 digits) as a lightweight sector proxy
+    close_df = pd.DataFrame(close_dict)
+
+    # Group stocks by 3-digit code prefix (e.g. sh.600xxx → '600')
     sector_groups: dict[str, list[str]] = {}
-    for sym in close_unstacked.columns:
-        code = sym.split(".")[0] if "." in str(sym) else str(sym)
-        code = code.upper().lstrip("SH").lstrip("SZ")
+    for sym in close_df.columns:
+        # baostock format: 'sh.600000' → code = '600000' → prefix = '600'
+        code = sym.split(".")[1] if "." in sym else sym
         prefix = code[:3]
         sector_groups.setdefault(f"sector_{prefix}", []).append(sym)
 
-    # Keep only groups with ≥ 5 stocks
-    sector_ret = pd.DataFrame(index=close_unstacked.index)
+    # Keep only groups with >= 5 stocks
+    sector_ret = pd.DataFrame(index=close_df.index)
     for name, syms in sector_groups.items():
         if len(syms) >= 5:
-            grp = close_unstacked[syms]
+            grp = close_df[syms]
             sector_ret[name] = grp.pct_change(20).mean(axis=1)
 
-    sector_ret = sector_ret.reindex(cal_idx)
-    return sector_ret
+    return sector_ret.reindex(cal_idx)
 
 
 def compute_lagged_factor_ic(
@@ -378,38 +495,9 @@ def compute_lagged_factor_ic(
     Returns:
         DataFrame indexed by datetime with one column per factor category.
     """
-    feature_groups = group_features_by_category(list(alpha158_df.columns))
-    dates = sorted(alpha158_df.index.get_level_values("datetime").unique())
-
-    ic_records = []
-    for dt in dates:
-        row = {"datetime": dt}
-        try:
-            day_factors = alpha158_df.xs(dt, level="datetime")
-            day_ret = returns.xs(dt, level="datetime") if isinstance(returns.index, pd.MultiIndex) else returns.loc[dt]
-        except KeyError:
-            ic_records.append(row)
-            continue
-
-        for cat in FACTOR_CATEGORIES:
-            feats = feature_groups.get(cat, [])
-            if not feats or day_ret.empty:
-                row[f"ic_{cat}"] = 0.0
-                continue
-            # Mean factor value per stock for this category
-            cat_score = day_factors[feats].mean(axis=1)
-            # Spearman rank correlation
-            valid = pd.DataFrame({"score": cat_score, "ret": day_ret}).dropna()
-            if len(valid) < 10:
-                row[f"ic_{cat}"] = 0.0
-            else:
-                row[f"ic_{cat}"] = valid["score"].corr(valid["ret"], method="spearman")
-        ic_records.append(row)
-
-    ic_df = pd.DataFrame(ic_records).set_index("datetime")
-
-    # Rolling mean over lookback window
-    ic_df = ic_df.rolling(lookback, min_periods=5).mean().fillna(0)
+    ic_df = compute_daily_category_ic(alpha158_df, returns, min_valid=10)
+    ic_df = ic_df.rename(columns={c: f"ic_{c}" for c in ic_df.columns})
+    ic_df = ic_df.fillna(0.0).rolling(lookback, min_periods=5).mean().fillna(0)
     return ic_df
 
 
@@ -423,33 +511,23 @@ def load_raw_ohlcv(
 ) -> dict[str, pd.DataFrame]:
     """Load raw OHLCV data for specific symbols (Kronos input).
 
-    Follows the same pattern as ``finetune/qlib_data_preprocess.py:30-74``.
-
     Returns:
         Dict mapping symbol → DataFrame with columns
-        [open, high, low, close, volume, amount].
+        [open, high, low, close, vol, amt].
     """
     cfg = cfg or ScreenerConfig()
-    data_fields = ["$open", "$high", "$low", "$close", "$volume", "$vwap"]
-
-    loader = QlibDataLoader(config=data_fields)
-    raw = loader.load(symbols, start, end)
-    raw = raw.stack().unstack(level=1)
+    ohlcv = _get_ohlcv_cache(cfg)
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
 
     result = {}
-    for symbol in symbols:
-        if symbol not in raw.columns.get_level_values(0):
+    for sym in symbols:
+        sdf = ohlcv.get(sym)
+        if sdf is None:
             continue
-        sdf = raw[symbol]
-        sdf = sdf.reset_index().rename(columns={"level_1": "field"})
-        sdf = pd.pivot(sdf, index="datetime", columns="field", values=symbol)
-        sdf = sdf.rename(columns={
-            "$open": "open", "$high": "high", "$low": "low",
-            "$close": "close", "$volume": "volume", "$vwap": "vwap",
-        })
-        sdf["vol"] = sdf["volume"]
-        sdf["amt"] = sdf[["open", "high", "low", "close"]].mean(axis=1) * sdf["vol"]
-        sdf = sdf[["open", "high", "low", "close", "vol", "amt"]].dropna()
+        sdf = sdf.loc[(sdf.index >= start_ts) & (sdf.index <= end_ts)].copy()
+        # Rename columns to match Kronos expected format
+        sdf = sdf.rename(columns={"volume": "vol", "amount": "amt"})
         if len(sdf) >= cfg.kronos_lookback + cfg.kronos_pred_len:
-            result[symbol] = sdf
+            result[sym] = sdf
     return result

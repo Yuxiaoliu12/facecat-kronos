@@ -1,8 +1,9 @@
 """
 Walk-Forward Backtester
 
-Runs the full 4-layer pipeline with quarterly retraining (expanding window),
-no lookahead bias.  Reports layer attribution and comparison benchmarks.
+Runs the full 4-layer pipeline with rolling-window initial training and
+quarterly fine-tuning (warm-start XGBoost).  No lookahead bias.
+Reports layer attribution and comparison benchmarks.
 """
 
 import os
@@ -14,15 +15,17 @@ import pandas as pd
 
 from screener.config import ScreenerConfig
 from screener.data_pipeline import (
-    init_qlib,
+    init_data,
     load_alpha158_factors,
     load_alpha158_labels,
+    load_alpha158_year,
     load_market_regime_features,
     load_raw_ohlcv,
+    get_calendar,
+    _get_ohlcv_cache,
 )
 from screener.factor_timing_model import FactorTimingModel
 from screener.technical_ranker import TechnicalRanker
-from screener.kronos_screener import KronosScreener
 from screener.paper_trader import PaperTrader
 
 
@@ -35,7 +38,7 @@ class WalkForwardBacktester:
         # Models
         self.layer1 = FactorTimingModel(self.cfg)
         self.layer2 = TechnicalRanker(self.cfg)
-        self.layer3 = KronosScreener(self.cfg)
+        self.layer3 = None  # lazy-loaded when run_kronos=True
         self.trader = PaperTrader(self.cfg)
 
         # Data caches
@@ -52,94 +55,153 @@ class WalkForwardBacktester:
         print("=" * 60)
         print("Loading data…")
         print("=" * 60)
-        init_qlib(self.cfg)
+        init_data(self.cfg)
 
-        self._alpha158 = load_alpha158_factors(self.cfg)
-        self._labels = load_alpha158_labels(self.cfg)
+        # Alpha158 is loaded year-by-year inside Layer 1 to limit memory.
+        # We set it to None here; Layer 1 handles its own loading.
+        self._alpha158 = None
+        self._labels = None
         self._regime = load_market_regime_features(self.cfg)
 
-        from qlib.data import D
-        self._calendar = pd.DatetimeIndex(D.calendar(
-            start_time=self.cfg.train_start, end_time=self.cfg.backtest_end
-        ))
+        self._calendar = get_calendar(
+            self.cfg, self.cfg.train_start, self.cfg.backtest_end
+        )
 
         # Load OHLCV for all universe stocks (needed for Layer 2 features + paper trading)
-        all_symbols = list(self._alpha158.index.get_level_values("instrument").unique())
+        all_symbols = list(_get_ohlcv_cache(self.cfg).keys())
         print(f"Loading OHLCV for {len(all_symbols)} symbols…")
         self._ohlcv = load_raw_ohlcv(
             all_symbols, self.cfg.train_start, self.cfg.backtest_end, self.cfg
         )
         print(f"OHLCV loaded for {len(self._ohlcv)} symbols.")
 
+        # Precompute Layer 2 technical features for all stocks (cache for fast lookup)
+        self.layer2.precompute_features(self._ohlcv)
+
     # ── Retraining Windows ───────────────────────────────────────────────
 
     def _generate_retrain_windows(self) -> list[dict]:
-        """Generate quarterly expanding-window retrain schedule.
+        """Generate quarterly rolling-window schedule.
+
+        Window 1: initial full training on [backtest_start - train_years, backtest_start - 1d]
+        Windows 2+: fine-tune on previous quarter's data only.
 
         Returns list of dicts with keys:
-          train_end, val_start, val_end, test_start, test_end
+          train_start, train_end, test_start, test_end, mode
         """
+        cfg = self.cfg
         windows = []
-        backtest_start = pd.Timestamp(self.cfg.backtest_start)
-        backtest_end = pd.Timestamp(self.cfg.backtest_end)
+        backtest_start = pd.Timestamp(cfg.backtest_start)
+        backtest_end = pd.Timestamp(cfg.backtest_end)
 
-        # Generate quarterly boundaries within backtest period
         quarters = pd.date_range(backtest_start, backtest_end, freq="QS")
         if len(quarters) == 0:
             quarters = pd.DatetimeIndex([backtest_start])
 
         for i, q_start in enumerate(quarters):
-            q_end = quarters[i + 1] - pd.Timedelta(days=1) if i + 1 < len(quarters) else backtest_end
+            q_end = (
+                quarters[i + 1] - pd.Timedelta(days=1)
+                if i + 1 < len(quarters)
+                else backtest_end
+            )
 
-            # Expanding window: train starts from cfg.train_start, ends 6 months before test
-            train_end_approx = q_start - pd.DateOffset(months=6)
-            val_start = train_end_approx + pd.Timedelta(days=1)
-            val_end = q_start - pd.Timedelta(days=1)
+            if i == 0:
+                # Initial: full training on [backtest_start - train_years, backtest_start - 1d]
+                train_start = q_start - pd.DateOffset(years=cfg.train_years)
+                train_end = q_start - pd.Timedelta(days=1)
+                mode = "initial"
+            else:
+                # Fine-tune: train on previous quarter's data only
+                train_start = quarters[i - 1]
+                train_end = q_start - pd.Timedelta(days=1)
+                mode = "finetune"
 
             windows.append({
-                "train_end": train_end_approx.strftime("%Y-%m-%d"),
-                "val_start": val_start.strftime("%Y-%m-%d"),
-                "val_end": val_end.strftime("%Y-%m-%d"),
+                "train_start": train_start.strftime("%Y-%m-%d"),
+                "train_end": train_end.strftime("%Y-%m-%d"),
                 "test_start": q_start.strftime("%Y-%m-%d"),
                 "test_end": q_end.strftime("%Y-%m-%d"),
+                "mode": mode,
             })
 
         return windows
 
     # ── Layer 1+2 Training ───────────────────────────────────────────────
 
-    def _train_layer1(self, train_end: str):
-        """Train/retrain Layer 1 factor timing model."""
-        print(f"\n  Training Layer 1 (train_end={train_end})…")
-        X, Y = self.layer1.build_training_data(self._alpha158, self._regime)
-        self.layer1.train(X, Y, train_end=train_end)
+    def _train_layer1(self, train_start: str, train_end: str):
+        """Full initial training for Layer 1."""
+        print(f"\n  Training Layer 1 ({train_start} → {train_end})…")
+        X, Y = self.layer1.build_training_data(
+            self._alpha158, self._regime,
+            train_start=train_start, train_end=train_end,
+        )
+        self.layer1.train(X, Y, train_start=train_start, train_end=train_end)
 
-    def _train_layer2(self, train_end: str):
-        """Train/retrain Layer 2 technical ranker."""
-        print(f"\n  Training Layer 2 (train_end={train_end})…")
+    def _finetune_layer1(self, train_start: str, train_end: str):
+        """Fine-tune Layer 1 on new quarter's data."""
+        print(f"\n  Fine-tuning Layer 1 ({train_start} → {train_end})…")
+        X, Y = self.layer1.build_training_data(
+            self._alpha158, self._regime,
+            train_start=train_start, train_end=train_end,
+        )
+        self.layer1.finetune(X, Y)
+
+    def _get_layer2_dates(self, train_start: str, train_end: str) -> list:
+        """Get training dates for Layer 2 with leakage trimming and subsampling."""
+        start_ts = pd.Timestamp(train_start)
         end_ts = pd.Timestamp(train_end)
-
-        # Build training data: sample dates from training period
         train_dates = self._calendar[
-            (self._calendar >= pd.Timestamp(self.cfg.train_start))
-            & (self._calendar <= end_ts)
+            (self._calendar >= start_ts) & (self._calendar <= end_ts)
         ]
+        # Leakage trim: drop last N dates whose forward returns peek into test
+        trim = self.cfg.forward_horizon_days
+        if len(train_dates) > trim:
+            train_dates = train_dates[:-trim]
         # Subsample for speed (every 5th trading day)
         train_dates = train_dates[::5]
+        return list(train_dates)
 
-        # Forward returns for labels
-        fwd_ret = self._compute_forward_returns()
-
-        X, y, group = self.layer2.build_training_data(
-            self._ohlcv, list(train_dates), fwd_ret
+    def _train_layer2(self, train_start: str, train_end: str):
+        """Full initial training for Layer 2."""
+        print(f"\n  Training Layer 2 ({train_start} → {train_end})…")
+        train_dates = self._get_layer2_dates(train_start, train_end)
+        upside, downside = self._compute_forward_hl_returns()
+        X, y_up, y_down = self.layer2.build_training_data(
+            self._ohlcv, train_dates, upside, downside
         )
         if len(X) > 0:
-            self.layer2.train(X, y, group)
+            self.layer2.train(X, y_up, y_down)
         else:
             print("  Warning: no training data for Layer 2")
 
-    def _compute_forward_returns(self) -> pd.DataFrame:
-        """Compute 5-day forward returns for all stocks (for Layer 2 labels)."""
+    def _finetune_layer2(self, train_start: str, train_end: str):
+        """Fine-tune Layer 2 on new quarter's data."""
+        print(f"\n  Fine-tuning Layer 2 ({train_start} → {train_end})…")
+        train_dates = self._get_layer2_dates(train_start, train_end)
+        upside, downside = self._compute_forward_hl_returns()
+        X, y_up, y_down = self.layer2.build_training_data(
+            self._ohlcv, train_dates, upside, downside
+        )
+        if len(X) > 0:
+            self.layer2.finetune(X, y_up, y_down)
+        else:
+            print("  Warning: no fine-tuning data for Layer 2")
+
+    def _compute_forward_hl_returns(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Compute forward max-high upside and min-low downside."""
+        fwd = self.cfg.layer2_forward_days  # 5
+        upside_dict, downside_dict = {}, {}
+        for sym, df in self._ohlcv.items():
+            close, high, low = df["close"], df["high"], df["low"]
+            # Forward max high over [t+1, t+fwd]: reverse → rolling max → reverse → shift
+            fwd_max = high[::-1].rolling(fwd, min_periods=fwd).max()[::-1].shift(-1)
+            fwd_min = low[::-1].rolling(fwd, min_periods=fwd).min()[::-1].shift(-1)
+            upside_dict[sym] = fwd_max / close - 1
+            downside_dict[sym] = fwd_min / close - 1
+        return pd.DataFrame(upside_dict), pd.DataFrame(downside_dict)
+
+    def _compute_forward_close_returns(self) -> pd.DataFrame:
+        """Compute 5-day forward close-to-close returns (for attribution only)."""
         close_dict = {}
         for sym, df in self._ohlcv.items():
             close_dict[sym] = df["close"]
@@ -184,7 +246,7 @@ class WalkForwardBacktester:
         # Layer 3: Kronos → top 5
         layer3_picks = layer2_picks[:self.cfg.layer3_top_n]
         kronos_preds = {}
-        if run_kronos and layer2_picks:
+        if run_kronos and layer2_picks and self.layer3 is not None:
             try:
                 scores = self.layer3.screen_stocks(
                     self._ohlcv, layer2_picks, date
@@ -214,13 +276,13 @@ class WalkForwardBacktester:
         Returns:
             Dict with keys: metrics, nav_series, trade_log, layer_attribution.
         """
-        if self._alpha158 is None:
+        if self._ohlcv is None:
             self.load_data()
 
         windows = self._generate_retrain_windows()
         print(f"\nBacktest windows: {len(windows)}")
         for w in windows:
-            print(f"  Train→{w['train_end']}  Val:{w['val_start']}→{w['val_end']}  "
+            print(f"  [{w['mode']:>8}] Train:{w['train_start']}→{w['train_end']}  "
                   f"Test:{w['test_start']}→{w['test_end']}")
 
         self.trader.reset()
@@ -228,16 +290,24 @@ class WalkForwardBacktester:
 
         for wi, window in enumerate(windows):
             print(f"\n{'='*60}")
-            print(f"Window {wi+1}/{len(windows)}: test {window['test_start']} → {window['test_end']}")
+            print(f"Window {wi+1}/{len(windows)} [{window['mode']}]: "
+                  f"test {window['test_start']} → {window['test_end']}")
             print(f"{'='*60}")
 
-            # Retrain models
-            self._train_layer1(window["train_end"])
-            self._train_layer2(window["train_end"])
+            # Train or fine-tune models
+            if window["mode"] == "initial":
+                self._train_layer1(window["train_start"], window["train_end"])
+                self._train_layer2(window["train_start"], window["train_end"])
+            else:
+                self._finetune_layer1(window["train_start"], window["train_end"])
+                self._finetune_layer2(window["train_start"], window["train_end"])
 
-            # Load Kronos model once per window
+            # Load Kronos model once per window (lazy import)
             if run_kronos:
                 try:
+                    if self.layer3 is None:
+                        from screener.kronos_screener import KronosScreener
+                        self.layer3 = KronosScreener(self.cfg)
                     self.layer3.load_model()
                 except Exception as e:
                     print(f"  Kronos model load failed: {e}")
@@ -278,11 +348,10 @@ class WalkForwardBacktester:
                     ranked_symbols=pipeline_out.get("layer3", []),
                     ohlcv_today=ohlcv_today,
                     ohlcv_prev=ohlcv_prev,
-                    kronos_predictions=pipeline_out.get("kronos_preds", {}),
                 )
 
             # Unload Kronos after each window to save GPU memory
-            if run_kronos:
+            if run_kronos and self.layer3 is not None:
                 self.layer3.unload_model()
 
         # ── Results ──────────────────────────────────────────────────────
@@ -314,7 +383,7 @@ class WalkForwardBacktester:
         Computes the average 5-day forward return of stocks at each layer's
         cutoff to see how much each layer improves selection.
         """
-        fwd_ret = self._compute_forward_returns()
+        fwd_ret = self._compute_forward_close_returns()
 
         layer_returns = {"layer1": [], "layer2": [], "layer3": [], "universe": []}
 
