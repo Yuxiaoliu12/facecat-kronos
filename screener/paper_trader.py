@@ -233,6 +233,10 @@ class PaperTrader:
             sym = self.position.symbol
             today_row = ohlcv_today.get(sym)
 
+            # Suspended stocks (volume=0) are untradeable
+            if today_row is not None and today_row.get("volume", today_row.get("vol", 0)) <= 0:
+                today_row = None
+
             if today_row is not None:
                 exit_reason, fill_price = self._check_exit_rules(today_row)
                 if exit_reason and fill_price is not None:
@@ -249,7 +253,7 @@ class PaperTrader:
                 if self.position is not None:
                     self.position.hold_days += 1
             else:
-                # No data for held stock today — increment hold_days
+                # No data / suspended stock today — increment hold_days
                 if self.position is not None:
                     self.position.hold_days += 1
 
@@ -258,6 +262,10 @@ class PaperTrader:
             for sym in ranked_symbols:
                 today_row = ohlcv_today.get(sym)
                 if today_row is None:
+                    continue
+
+                # Skip suspended stocks (volume=0)
+                if today_row.get("volume", today_row.get("vol", 0)) <= 0:
                     continue
 
                 open_price = today_row.get("open", today_row.get("$open", 0))
