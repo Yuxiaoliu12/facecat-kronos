@@ -117,6 +117,14 @@ class FactorTimingModel:
         ic_df = ic_df.rename(columns={c: f"fwd_ic_{c}" for c in ic_df.columns})
         return ic_df.fillna(0.0)
 
+    def _compute_sample_weights(self, index: pd.DatetimeIndex) -> np.ndarray | None:
+        """Exponential recency weights: weight = 2^(-days_ago / halflife)."""
+        halflife = self.cfg.sample_weight_halflife_days
+        if halflife <= 0:
+            return None
+        days_ago = (index.max() - index).days.astype(float)
+        return np.exp(-np.log(2) * days_ago / halflife)
+
     def train(
         self,
         X: pd.DataFrame | None = None,
@@ -144,9 +152,10 @@ class FactorTimingModel:
         print(f"Layer 1 training: {len(X_train)} days, {len(self.feature_names)} features, "
               f"{len(self.target_names)} targets")
 
+        sw = self._compute_sample_weights(X_train.index)
         base = XGBRegressor(**self.cfg.layer1_xgb_params)
         self.model = MultiOutputRegressor(base)
-        self.model.fit(X_train.values, Y_train.values)
+        self.model.fit(X_train.values, Y_train.values, sample_weight=sw)
         print("Layer 1 model trained.")
 
     def finetune(self, X_new: pd.DataFrame, Y_new: pd.DataFrame):
@@ -167,6 +176,7 @@ class FactorTimingModel:
         print(f"Layer 1 fine-tune: {len(X_new)} days, "
               f"+{self.cfg.finetune_n_estimators} trees @ lr={self.cfg.finetune_learning_rate}")
 
+        sw = self._compute_sample_weights(X_new.index)
         for i, est in enumerate(self.model.estimators_):
             est.set_params(
                 n_estimators=self.cfg.finetune_n_estimators,
@@ -174,6 +184,7 @@ class FactorTimingModel:
             )
             est.fit(
                 X_new.values, Y_new.iloc[:, i].values,
+                sample_weight=sw,
                 xgb_model=est.get_booster(),
             )
         print("Layer 1 fine-tune complete.")
@@ -236,9 +247,10 @@ class FactorTimingModel:
         x = regime_row.reindex(self.feature_names, fill_value=0).values.reshape(1, -1)
         predicted_weights = self.model.predict(x)[0]  # shape (n_categories,)
 
-        # Normalise weights to [0, 1] via softmax-like transform
-        weights = np.exp(predicted_weights)
-        weights = weights / (weights.sum() + 1e-9)
+        # Sign-preserving normalisation: negative IC → negative weight
+        weights = np.clip(predicted_weights, -1, 1)
+        abs_sum = np.abs(weights).sum() + 1e-9
+        weights = weights / abs_sum
         weight_map = dict(zip(FACTOR_CATEGORIES, weights))
 
         # Get per-stock Alpha158 for this date

@@ -30,7 +30,7 @@ class ScreenerConfig:
     })
     layer1_forward_days: int = 5  # IC label horizon
 
-    # ── Layer 2 — Technical Ranker (dual XGBRegressor) ──────────────────
+    # ── Layer 2 — Technical Ranker (single XGBRegressor) ─────────────────
     layer2_top_n: int = 30
     layer2_xgb_params: dict = field(default_factory=lambda: {
         "n_estimators": 300,
@@ -83,6 +83,9 @@ class ScreenerConfig:
     # Fine-tuning (warm-start) hyperparameters
     finetune_n_estimators: int = 50         # trees added per fine-tune round
     finetune_learning_rate: float = 0.02    # conservative LR for updates
+
+    # Exponential sample weighting: recent data weighted higher
+    sample_weight_halflife_days: int = 120  # half-weight every ~6 months; 0 = disabled
 
     # Auto-computed from backtest_start - train_years (set in __post_init__)
     train_start: str = ""

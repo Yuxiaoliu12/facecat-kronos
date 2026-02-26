@@ -165,12 +165,12 @@ class WalkForwardBacktester:
         """Full initial training for Layer 2."""
         print(f"\n  Training Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
-        upside, downside = self._compute_forward_hl_returns()
-        X, y_up, y_down = self.layer2.build_training_data(
-            self._ohlcv, train_dates, upside, downside
+        combined = self._compute_forward_combined_returns()
+        X, y, w = self.layer2.build_training_data(
+            self._ohlcv, train_dates, combined
         )
         if len(X) > 0:
-            self.layer2.train(X, y_up, y_down)
+            self.layer2.train(X, y, sample_weight=w)
         else:
             print("  Warning: no training data for Layer 2")
 
@@ -178,27 +178,25 @@ class WalkForwardBacktester:
         """Fine-tune Layer 2 on new quarter's data."""
         print(f"\n  Fine-tuning Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
-        upside, downside = self._compute_forward_hl_returns()
-        X, y_up, y_down = self.layer2.build_training_data(
-            self._ohlcv, train_dates, upside, downside
+        combined = self._compute_forward_combined_returns()
+        X, y, w = self.layer2.build_training_data(
+            self._ohlcv, train_dates, combined
         )
         if len(X) > 0:
-            self.layer2.finetune(X, y_up, y_down)
+            self.layer2.finetune(X, y, sample_weight=w)
         else:
             print("  Warning: no fine-tuning data for Layer 2")
 
-    def _compute_forward_hl_returns(self) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Compute forward max-high upside and min-low downside."""
+    def _compute_forward_combined_returns(self) -> pd.DataFrame:
+        """Compute forward combined upside + downside returns."""
         fwd = self.cfg.layer2_forward_days  # 5
-        upside_dict, downside_dict = {}, {}
+        combined_dict = {}
         for sym, df in self._ohlcv.items():
             close, high, low = df["close"], df["high"], df["low"]
-            # Forward max high over [t+1, t+fwd]: reverse → rolling max → reverse → shift
             fwd_max = high[::-1].rolling(fwd, min_periods=fwd).max()[::-1].shift(-1)
             fwd_min = low[::-1].rolling(fwd, min_periods=fwd).min()[::-1].shift(-1)
-            upside_dict[sym] = fwd_max / close - 1
-            downside_dict[sym] = fwd_min / close - 1
-        return pd.DataFrame(upside_dict), pd.DataFrame(downside_dict)
+            combined_dict[sym] = (fwd_max / close - 1) + (fwd_min / close - 1)
+        return pd.DataFrame(combined_dict)
 
     def _compute_forward_close_returns(self) -> pd.DataFrame:
         """Compute 5-day forward close-to-close returns (for attribution only)."""

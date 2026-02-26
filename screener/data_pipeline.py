@@ -361,9 +361,11 @@ def load_alpha158_labels(
     for sym, sdf in ohlcv.items():
         close = sdf["close"]
         high = sdf["high"]
-        # Forward max-high return over [t+1, t+fwd]
+        low = sdf["low"]
+        # Combined upside + downside: penalises stocks with worse downside than upside
         fwd_max_high = high[::-1].rolling(fwd, min_periods=fwd).max()[::-1].shift(-1)
-        fwd_ret = fwd_max_high / close - 1
+        fwd_min_low = low[::-1].rolling(fwd, min_periods=fwd).min()[::-1].shift(-1)
+        fwd_ret = (fwd_max_high / close - 1) + (fwd_min_low / close - 1)
         fwd_ret = fwd_ret.loc[(fwd_ret.index >= start_ts) & (fwd_ret.index <= end_ts)]
         fwd_ret = fwd_ret.dropna()
         if fwd_ret.empty:
