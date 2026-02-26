@@ -182,9 +182,8 @@ class KronosScreener:
             self.load_model()
 
         cfg = self.cfg
-        from qlib.data import D
-        cal = D.calendar()
-        cal = pd.DatetimeIndex(cal)
+        from screener.data_pipeline import get_full_calendar
+        cal = get_full_calendar(cfg)
 
         results = []
         for sym in symbols:

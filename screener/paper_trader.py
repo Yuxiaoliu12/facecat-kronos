@@ -1,7 +1,7 @@
 """
 Layer 4: Paper Trading Engine
 
-Full-capital-per-trade paper trader with Kronos-predicted exit rules,
+Full-capital-per-trade paper trader with fixed TP/SL exit rules,
 A-share lot rounding, commission fees, and 涨停/跌停 (limit) handling.
 """
 
@@ -20,7 +20,6 @@ class Position:
     shares: int
     entry_price: float
     entry_date: pd.Timestamp
-    predicted_candles: pd.DataFrame  # Kronos predicted OHLCV (pred_len rows)
     hold_days: int = 0
 
 
@@ -37,7 +36,7 @@ class Trade:
 
 
 class PaperTrader:
-    """Paper trading engine with Kronos-predicted exit rules."""
+    """Paper trading engine with fixed TP/SL exit rules."""
 
     def __init__(self, cfg: ScreenerConfig | None = None):
         self.cfg = cfg or ScreenerConfig()
@@ -45,7 +44,6 @@ class PaperTrader:
         self.position: Position | None = None
         self.trade_log: list[Trade] = []
         self.daily_nav: list[tuple[pd.Timestamp, float]] = []  # (date, NAV)
-        self._prev_close: dict[str, float] = {}  # for limit-price checks
 
     # ── Commission ───────────────────────────────────────────────────────
 
@@ -92,7 +90,6 @@ class PaperTrader:
         date: pd.Timestamp,
         symbol: str,
         price: float,
-        predicted_candles: pd.DataFrame,
         prev_close: float | None = None,
     ) -> bool:
         """Attempt to buy a stock with full capital.
@@ -131,7 +128,6 @@ class PaperTrader:
             shares=shares,
             entry_price=price,
             entry_date=date,
-            predicted_candles=predicted_candles,
             hold_days=0,
         )
         self.trade_log.append(Trade(
@@ -145,19 +141,12 @@ class PaperTrader:
         date: pd.Timestamp,
         price: float,
         reason: str = "",
-        prev_close: float | None = None,
     ) -> bool:
-        """Attempt to sell current position.
+        """Sell current position at given price.
 
-        Returns True if executed, False if blocked (跌停).
+        Returns True if executed, False if no position.
         """
         if self.position is None:
-            return False
-
-        # Limit-down check
-        if prev_close is not None and self._is_limit_down_open(
-            self.position.symbol, price, prev_close
-        ):
             return False
 
         shares = self.position.shares
@@ -181,50 +170,38 @@ class PaperTrader:
     # ── Exit Rule Evaluation ─────────────────────────────────────────────
 
     def _check_exit_rules(
-        self, actual_close: float, actual_row: pd.Series
-    ) -> str | None:
-        """Check Kronos-predicted exit rules against today's actual close.
+        self, today_row: pd.Series,
+    ) -> tuple[str | None, float | None]:
+        """Check TP/SL exit rules against today's OHLCV bar.
 
-        Returns exit reason string or None if no exit triggered.
-        All exits execute at next-day open.
+        Returns (exit_reason, fill_price) or (None, None) if no exit.
+        SL checked first (conservative — assume worst case when both hit).
         """
         pos = self.position
-        if pos is None:
-            return None
+        if pos is None or pos.hold_days < 1:  # T+1: can't sell on buy day
+            return None, None
 
-        pred = pos.predicted_candles
-        day_idx = pos.hold_days  # 0-indexed
+        entry = pos.entry_price
+        tp_price = entry * (1 + self.cfg.tp_pct)
+        sl_price = entry * (1 - self.cfg.sl_pct)
+        today_high = today_row.get("high", today_row.get("$high", float("inf")))
+        today_low = today_row.get("low", today_row.get("$low", 0))
+        today_open = today_row.get("open", today_row.get("$open", 0))
+        today_close = today_row.get("close", today_row.get("$close", 0))
+
+        # SL first (conservative)
+        if today_low <= sl_price:
+            return "stop_loss", min(sl_price, today_open)  # gap-down → fill at open
+
+        # TP
+        if today_high >= tp_price:
+            return "take_profit", max(tp_price, today_open)  # gap-up → fill at open
 
         # Time limit
-        if day_idx >= self.cfg.max_hold_days:
-            return "time_limit"
+        if pos.hold_days >= self.cfg.max_hold_days:
+            return "time_limit", today_close
 
-        # Check if we have predictions for this day
-        if day_idx >= len(pred):
-            return "time_limit"
-
-        pred_row = pred.iloc[day_idx]
-        pred_high = pred_row.get("high", pred_row.get("$high", float("inf")))
-        pred_low = pred_row.get("low", pred_row.get("$low", 0))
-        pred_close = pred_row.get("close", pred_row.get("$close", actual_close))
-
-        # Take-profit: actual close > predicted high
-        if actual_close > pred_high:
-            return "take_profit"
-
-        # Stop-loss: actual close < predicted low
-        if actual_close < pred_low:
-            return "stop_loss"
-
-        # Trajectory deviation: actual close deviates from predicted close
-        # by more than 2× the predicted daily range
-        pred_range = abs(pred_high - pred_low)
-        if pred_range > 0:
-            deviation = abs(actual_close - pred_close)
-            if deviation > self.cfg.deviation_multiplier * pred_range:
-                return "trajectory_deviation"
-
-        return None
+        return None, None
 
     # ── Daily Update ─────────────────────────────────────────────────────
 
@@ -234,12 +211,10 @@ class PaperTrader:
         ranked_symbols: list[str],
         ohlcv_today: dict[str, pd.Series],
         ohlcv_prev: dict[str, pd.Series] | None = None,
-        kronos_predictions: dict[str, pd.DataFrame] | None = None,
     ):
         """Process one trading day.
 
-        1. For held positions: check exit rules against yesterday's close,
-           execute sell at today's open if triggered.
+        1. If holding: check TP/SL/time exit against today's bar. Sell if triggered.
         2. If no position: buy the top-ranked stock at today's open.
 
         Args:
@@ -247,7 +222,6 @@ class PaperTrader:
             ranked_symbols: Symbols ranked by the pipeline (best first).
             ohlcv_today: symbol → Series with open/high/low/close/volume for today.
             ohlcv_prev: symbol → Series for previous day (for limit checks).
-            kronos_predictions: symbol → predicted candles DataFrame.
         """
         prev_close_map = {}
         if ohlcv_prev:
@@ -260,29 +234,24 @@ class PaperTrader:
             today_row = ohlcv_today.get(sym)
 
             if today_row is not None:
-                # Exit rules were evaluated yesterday at close → execute at today's open
-                exit_reason = self._pending_exit_reason
-                if exit_reason:
-                    open_price = today_row.get("open", today_row.get("$open", 0))
+                exit_reason, fill_price = self._check_exit_rules(today_row)
+                if exit_reason and fill_price is not None:
                     prev_cl = prev_close_map.get(sym, 0)
-
-                    # Check 一字板 / 跌停
+                    # Check 一字板 / 跌停 before selling
                     if self._is_yizi_ban(today_row):
                         pass  # can't sell, carry to next day
+                    elif prev_cl > 0 and self._is_limit_down_open(sym, today_row.get("open", 0), prev_cl):
+                        pass  # limit down at open, can't sell
                     else:
-                        sold = self.sell(date, open_price, exit_reason, prev_cl)
-                        if sold:
-                            self._pending_exit_reason = None
+                        self.sell(date, fill_price, exit_reason)
 
-                # Evaluate today's exit rules (will execute tomorrow)
-                actual_close = today_row.get("close", today_row.get("$close", 0))
-                self.position.hold_days += 1
-                self._pending_exit_reason = self._check_exit_rules(
-                    actual_close, today_row
-                )
+                # Increment hold_days after exit check
+                if self.position is not None:
+                    self.position.hold_days += 1
             else:
-                # No data for held stock today — force sell next opportunity
-                self._pending_exit_reason = "no_data"
+                # No data for held stock today — increment hold_days
+                if self.position is not None:
+                    self.position.hold_days += 1
 
         # ── Step 2: Buy if no position ───────────────────────────────────
         if self.position is None and ranked_symbols:
@@ -303,14 +272,8 @@ class PaperTrader:
                 ):
                     continue
 
-                # Get Kronos predictions for this stock
-                pred_candles = pd.DataFrame()
-                if kronos_predictions and sym in kronos_predictions:
-                    pred_candles = kronos_predictions[sym]
-
-                bought = self.buy(date, sym, open_price, pred_candles, prev_cl)
+                bought = self.buy(date, sym, open_price, prev_cl)
                 if bought:
-                    self._pending_exit_reason = None
                     break
 
         # ── Record NAV ───────────────────────────────────────────────────
@@ -398,8 +361,3 @@ class PaperTrader:
         self.position = None
         self.trade_log = []
         self.daily_nav = []
-        self._pending_exit_reason = None
-        self._prev_close = {}
-
-    # Initialise mutable internal state
-    _pending_exit_reason: str | None = None

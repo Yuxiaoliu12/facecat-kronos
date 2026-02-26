@@ -72,8 +72,12 @@ class NewsScorer:
             return []
 
         # Normalise symbol to bare 6-digit code
-        code = symbol.split(".")[0] if "." in symbol else symbol
-        code = code.upper().lstrip("SH").lstrip("SZ")
+        # baostock format: 'sh.600000' → '600000'
+        # Qlib/bare format: 'SH600000' → '600000'
+        if "." in symbol:
+            code = symbol.split(".")[-1]
+        else:
+            code = symbol.upper().lstrip("SH").lstrip("SZ")
 
         try:
             df = ak.stock_news_em(symbol=code)

@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ScreenerConfig:
-    # ── Qlib / Universe ──────────────────────────────────────────────────
-    qlib_data_path: str = "~/.qlib/qlib_data/cn_data"
-    universe: str = "csi500"
-    benchmark: str = "SH000905"
+    # ── Data Sources ─────────────────────────────────────────────────────
+    ohlcv_pickle_path: str = "data/ohlcv_all_a.pkl"
+    benchmark_pickle_path: str = "data/benchmark_000905.pkl"
+    benchmark: str = "sh.000905"
 
     # ── Layer 1 — Factor Timing (XGBoost) ────────────────────────────────
     layer1_top_n: int = 200
@@ -30,7 +30,7 @@ class ScreenerConfig:
     })
     layer1_forward_days: int = 5  # IC label horizon
 
-    # ── Layer 2 — Technical Ranker (XGBRanker) ───────────────────────────
+    # ── Layer 2 — Technical Ranker (dual XGBRegressor) ──────────────────
     layer2_top_n: int = 30
     layer2_xgb_params: dict = field(default_factory=lambda: {
         "n_estimators": 300,
@@ -38,7 +38,6 @@ class ScreenerConfig:
         "learning_rate": 0.05,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "objective": "rank:pairwise",
         "tree_method": "hist",
         "random_state": 42,
     })
@@ -64,27 +63,33 @@ class ScreenerConfig:
     buy_commission: float = 0.00025       # 0.025%
     sell_commission: float = 0.00025      # 0.025%
     stamp_tax: float = 0.0005            # 0.05%  (sell only)
-    max_hold_days: int = 10              # = kronos_pred_len
+    max_hold_days: int = 5
     lot_size: int = 100                  # A-share minimum lot
-    deviation_multiplier: float = 2.0    # trajectory deviation threshold
+    tp_pct: float = 0.05                 # take-profit threshold (5%)
+    sl_pct: float = 0.05                 # stop-loss threshold (5%)
 
     # Limit-up/down thresholds by board
     limit_main: float = 0.10    # 主板
     limit_gem_star: float = 0.20  # 创业板 / 科创板
     limit_ipo_gem_star: float = 0.30  # first 5 days IPO on 创业板/科创板
 
-    # ── Time Ranges ──────────────────────────────────────────────────────
-    train_start: str = "2015-01-01"
-    train_end: str = "2019-06-30"
-    val_start: str = "2019-07-01"
-    val_end: str = "2020-03-31"
-    backtest_start: str = "2020-04-01"
-    backtest_end: str = "2020-09-25"
+    # ── Walk-Forward Settings ─────────────────────────────────────────────
+    backtest_start: str = "2017-01-01"
+    backtest_end: str = "2017-12-31"
+    train_years: int = 2                    # initial rolling window size
+    forward_horizon_days: int = 5           # leakage trim (drop last N train rows)
+    retrain_freq: str = "Q"                 # quarterly
 
-    retrain_freq: str = "Q"  # quarterly
+    # Fine-tuning (warm-start) hyperparameters
+    finetune_n_estimators: int = 50         # trees added per fine-tune round
+    finetune_learning_rate: float = 0.02    # conservative LR for updates
 
-    # ── Persistence (Colab / Google Drive) ───────────────────────────────
-    drive_root: str = "/content/drive/MyDrive/screener"
+    # Auto-computed from backtest_start - train_years (set in __post_init__)
+    train_start: str = ""
+    train_end: str = ""
+
+    # ── Persistence ──────────────────────────────────────────────────────
+    drive_root: str = "output/screener"
     alpha158_cache: str = ""    # auto-set in __post_init__
     model_cache: str = ""       # auto-set in __post_init__
 
@@ -100,9 +105,18 @@ class ScreenerConfig:
     ])
 
     def __post_init__(self):
+        import pandas as pd
+
         self.alpha158_cache = os.path.join(self.drive_root, "alpha158_cache.pkl")
         self.model_cache = os.path.join(self.drive_root, "models")
         if not self.kronos_tokenizer_path:
             self.kronos_tokenizer_path = os.path.join(self.drive_root, "models", "kronos_tokenizer")
         if not self.kronos_predictor_path:
             self.kronos_predictor_path = os.path.join(self.drive_root, "models", "kronos_predictor")
+
+        # Auto-compute train bounds from backtest_start - train_years
+        bt_start = pd.Timestamp(self.backtest_start)
+        if not self.train_start:
+            self.train_start = (bt_start - pd.DateOffset(years=self.train_years)).strftime("%Y-%m-%d")
+        if not self.train_end:
+            self.train_end = (bt_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
