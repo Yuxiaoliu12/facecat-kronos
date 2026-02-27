@@ -74,7 +74,7 @@ class ScreenerConfig:
     limit_ipo_gem_star: float = 0.30  # first 5 days IPO on 创业板/科创板
 
     # ── Walk-Forward Settings ─────────────────────────────────────────────
-    backtest_start: str = "2017-01-01"
+    backtest_start: str = "2018-01-01"
     backtest_end: str = "2025-12-31"
     train_years: int = 2                    # initial rolling window size
     forward_horizon_days: int = 5           # leakage trim (drop last N train rows)
