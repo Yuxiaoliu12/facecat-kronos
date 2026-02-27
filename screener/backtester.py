@@ -285,13 +285,26 @@ class WalkForwardBacktester:
             print(f"  [{w['mode']:>8}] Train:{w['train_start']}→{w['train_end']}  "
                   f"Test:{w['test_start']}→{w['test_end']}")
 
-        self.trader.reset()
-        layer_outputs = []
+        # Check for existing checkpoint to resume from
+        ckpt = self._load_checkpoint()
+        if ckpt is not None:
+            resume_from = ckpt["completed_window"] + 1
+            pending_symbols = ckpt["pending_symbols"]
+            layer_outputs = ckpt["layer_outputs"]
+            self._restore_from_checkpoint(ckpt)
+            print(f"Skipping windows 1..{resume_from}, resuming at window {resume_from+1}")
+        else:
+            resume_from = 0
+            self.trader.reset()
+            layer_outputs = []
+            pending_symbols = []
+
         # Bug fix: signal on day T, trade on day T+1 to avoid look-ahead bias.
         # Features (Alpha158, technicals) use T's close, so we can't trade at T's open.
-        pending_symbols: list[str] = []
 
         for wi, window in enumerate(windows):
+            if wi < resume_from:
+                continue
             print(f"\n{'='*60}")
             print(f"Window {wi+1}/{len(windows)} [{window['mode']}]: "
                   f"test {window['test_start']} → {window['test_end']}")
@@ -369,6 +382,9 @@ class WalkForwardBacktester:
             if run_kronos and self.layer3 is not None:
                 self.layer3.unload_model()
 
+            # Save checkpoint after each completed window
+            self._save_checkpoint(wi, pending_symbols, layer_outputs)
+
         # ── Results ──────────────────────────────────────────────────────
         metrics = self.trader.get_metrics()
         nav = self.trader.get_nav_series()
@@ -381,6 +397,9 @@ class WalkForwardBacktester:
 
         # Layer attribution
         attribution = self._compute_layer_attribution(layer_outputs)
+
+        # Run complete — remove checkpoint
+        self._delete_checkpoint()
 
         return {
             "metrics": metrics,
@@ -438,6 +457,65 @@ class WalkForwardBacktester:
                   f"(±{stats['std']*100:.3f}%, n={stats['n_days']})")
 
         return attribution
+
+    # ── Checkpointing ───────────────────────────────────────────────────
+
+    def _checkpoint_path(self) -> str:
+        return os.path.join(self.cfg.run_dir, "checkpoint.pkl")
+
+    def _save_checkpoint(
+        self,
+        wi: int,
+        pending_symbols: list[str],
+        layer_outputs: list[dict],
+    ):
+        """Save progress after a completed quarterly window."""
+        ckpt = {
+            "completed_window": wi,
+            "pending_symbols": pending_symbols,
+            "layer_outputs": layer_outputs,
+            # PaperTrader state
+            "trader_cash": self.trader.cash,
+            "trader_position": self.trader.position,
+            "trader_trade_log": self.trader.trade_log,
+            "trader_daily_nav": self.trader.daily_nav,
+            # Model state
+            "layer1_model": self.layer1.model,
+            "layer1_feature_names": self.layer1.feature_names,
+            "layer2_model": self.layer2.model,
+        }
+        path = self._checkpoint_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(ckpt, f)
+        print(f"  Checkpoint saved (window {wi+1}) → {path}")
+
+    def _load_checkpoint(self) -> dict | None:
+        """Load checkpoint if one exists. Returns checkpoint dict or None."""
+        path = self._checkpoint_path()
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            ckpt = pickle.load(f)
+        print(f"\n*** Resuming from checkpoint (completed window {ckpt['completed_window']+1}) ***")
+        return ckpt
+
+    def _restore_from_checkpoint(self, ckpt: dict):
+        """Restore trader and model state from checkpoint dict."""
+        self.trader.cash = ckpt["trader_cash"]
+        self.trader.position = ckpt["trader_position"]
+        self.trader.trade_log = ckpt["trader_trade_log"]
+        self.trader.daily_nav = ckpt["trader_daily_nav"]
+        self.layer1.model = ckpt["layer1_model"]
+        self.layer1.feature_names = ckpt["layer1_feature_names"]
+        self.layer2.model = ckpt["layer2_model"]
+
+    def _delete_checkpoint(self):
+        """Remove checkpoint file after successful completion."""
+        path = self._checkpoint_path()
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"Checkpoint deleted (run complete) → {path}")
 
     # ── Persistence ──────────────────────────────────────────────────────
 
