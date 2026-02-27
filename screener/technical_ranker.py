@@ -186,12 +186,15 @@ class TechnicalRanker:
         """
         cache_path = os.path.join(self.cfg.cache_dir, "layer2_feature_cache.pkl")
 
+        expected = sum(1 for df in ohlcv_dict.values() if len(df) >= 60)
         if os.path.exists(cache_path):
             print(f"Loading Layer 2 feature cache from {cache_path}…", flush=True)
             with open(cache_path, "rb") as f:
                 self._feature_cache = pickle.load(f)
-            print(f"  Loaded {len(self._feature_cache)} stocks from cache.")
-            return
+            if len(self._feature_cache) >= expected * 0.95:
+                print(f"  Loaded {len(self._feature_cache)} stocks from cache.")
+                return
+            print(f"  Stale cache ({len(self._feature_cache)} stocks, expected ~{expected}). Recomputing…")
 
         print(f"Precomputing Layer 2 features for {len(ohlcv_dict)} stocks…", flush=True)
         cache = {}
@@ -242,7 +245,7 @@ class TechnicalRanker:
                     feats = cached.loc[date]
                     feats.name = sym
                     records.append(feats)
-                continue
+                    continue
             # Fallback: compute on the fly (backwards-compatible)
             df = ohlcv_dict.get(sym)
             if df is None or len(df) < 60:
