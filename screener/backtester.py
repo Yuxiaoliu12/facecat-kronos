@@ -49,6 +49,7 @@ class WalkForwardBacktester:
         self._regime: pd.DataFrame | None = None
         self._ohlcv: dict[str, pd.DataFrame] | None = None
         self._calendar: pd.DatetimeIndex | None = None
+        self._combined_returns: pd.DataFrame | None = None
 
     # ── Data Loading ─────────────────────────────────────────────────────
 
@@ -79,6 +80,14 @@ class WalkForwardBacktester:
 
         # Precompute Layer 2 technical features for all stocks (cache for fast lookup)
         self.layer2.precompute_features(self._ohlcv)
+
+        # Cache combined returns once (used by Layer 2 training in every window)
+        self._combined_returns = self._compute_forward_combined_returns()
+
+        # Precompute lagged IC + forward IC for all years (Layer 1)
+        train_start_year = pd.Timestamp(self.cfg.train_start).year
+        backtest_end_year = pd.Timestamp(self.cfg.backtest_end).year
+        self.layer1.precompute_ic(train_start_year, backtest_end_year)
 
     # ── Retraining Windows ───────────────────────────────────────────────
 
@@ -167,9 +176,8 @@ class WalkForwardBacktester:
         """Full initial training for Layer 2."""
         print(f"\n  Training Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
-        combined = self._compute_forward_combined_returns()
         X, y, w = self.layer2.build_training_data(
-            self._ohlcv, train_dates, combined
+            self._ohlcv, train_dates, self._combined_returns
         )
         if len(X) > 0:
             self.layer2.train(X, y, sample_weight=w)
@@ -180,9 +188,8 @@ class WalkForwardBacktester:
         """Fine-tune Layer 2 on new quarter's data."""
         print(f"\n  Fine-tuning Layer 2 ({train_start} → {train_end})…")
         train_dates = self._get_layer2_dates(train_start, train_end)
-        combined = self._compute_forward_combined_returns()
         X, y, w = self.layer2.build_training_data(
-            self._ohlcv, train_dates, combined
+            self._ohlcv, train_dates, self._combined_returns
         )
         if len(X) > 0:
             self.layer2.finetune(X, y, sample_weight=w)
@@ -224,7 +231,10 @@ class WalkForwardBacktester:
 
         # Layer 1: Factor Timing → top 200
         try:
-            layer1_picks = self.layer1.select_top(date, alpha158_df=self._alpha158)
+            regime_row = self._regime.loc[date] if date in self._regime.index else None
+            layer1_picks = self.layer1.select_top(
+                date, alpha158_df=self._alpha158, regime_row=regime_row
+            )
         except Exception as e:
             print(f"  Layer 1 failed on {date}: {e}")
             layer1_picks = []

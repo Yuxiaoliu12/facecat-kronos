@@ -37,6 +37,75 @@ class FactorTimingModel:
         self.target_names: list[str] = [f"fwd_ic_{c}" for c in FACTOR_CATEGORIES]
         self._alpha158_df: pd.DataFrame | None = None  # cached
         self._lagged_ic_df: pd.DataFrame | None = None  # for inference lookup
+        self._forward_ic_df: pd.DataFrame | None = None  # precomputed forward IC
+
+    # ── IC Precomputation ─────────────────────────────────────────────────
+
+    def precompute_ic(self, start_year: int, end_year: int):
+        """Precompute lagged IC and forward IC for all years, with disk caching.
+
+        Populates self._lagged_ic_df and self._forward_ic_df so that
+        build_training_data() and ensure_lagged_ic() become simple slices.
+        """
+        import gc
+
+        cfg = self.cfg
+        cache_dir = cfg.cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        realize_lag = cfg.forward_horizon_days
+
+        lagged_parts = []
+        forward_parts = []
+
+        print(f"  Precomputing IC for years {start_year}–{end_year}…")
+        for year in range(start_year, end_year + 1):
+            lagged_path = os.path.join(cache_dir, f"_lagged_ic_{year}.pkl")
+            forward_path = os.path.join(cache_dir, f"_forward_ic_{year}.pkl")
+
+            if os.path.exists(lagged_path) and os.path.exists(forward_path):
+                print(f"    {year}… (cached)", flush=True)
+                with open(lagged_path, "rb") as f:
+                    lagged_parts.append(pickle.load(f))
+                with open(forward_path, "rb") as f:
+                    forward_parts.append(pickle.load(f))
+                continue
+
+            print(f"    {year}…", end=" ", flush=True)
+            year_df = load_alpha158_year(cfg, year)
+            if year_df.empty:
+                print("(skip)")
+                continue
+            year_labels = load_alpha158_labels(cfg, f"{year}-01-01", f"{year}-12-31")
+
+            lagged_ic = compute_lagged_factor_ic(
+                year_df, year_labels, lookback=20, realize_lag=realize_lag,
+            )
+            forward_ic = self._compute_forward_ic(year_df, year_labels)
+
+            with open(lagged_path, "wb") as f:
+                pickle.dump(lagged_ic, f)
+            with open(forward_path, "wb") as f:
+                pickle.dump(forward_ic, f)
+
+            lagged_parts.append(lagged_ic)
+            forward_parts.append(forward_ic)
+            print(f"{len(year_df)} rows")
+            del year_df, year_labels, lagged_ic, forward_ic
+            gc.collect()
+
+        if lagged_parts:
+            self._lagged_ic_df = pd.concat(lagged_parts)
+            self._lagged_ic_df = self._lagged_ic_df.loc[
+                ~self._lagged_ic_df.index.duplicated(keep="last")
+            ]
+        if forward_parts:
+            self._forward_ic_df = pd.concat(forward_parts)
+            self._forward_ic_df = self._forward_ic_df.loc[
+                ~self._forward_ic_df.index.duplicated(keep="last")
+            ]
+        print(f"  IC precomputation complete: "
+              f"{len(self._lagged_ic_df) if self._lagged_ic_df is not None else 0} lagged, "
+              f"{len(self._forward_ic_df) if self._forward_ic_df is not None else 0} forward rows")
 
     # ── Training ─────────────────────────────────────────────────────────
 
@@ -66,12 +135,34 @@ class FactorTimingModel:
 
         realize_lag = cfg.forward_horizon_days
 
-        if alpha158_df is not None:
+        # Check if precomputed IC covers the requested range
+        ts_start_ts = pd.Timestamp(ts_start)
+        ts_end_ts = pd.Timestamp(ts_end)
+        precomputed_ok = (
+            self._lagged_ic_df is not None
+            and self._forward_ic_df is not None
+            and (self._lagged_ic_df.index >= ts_start_ts).any()
+            and (self._lagged_ic_df.index <= ts_end_ts).any()
+        )
+
+        if precomputed_ok:
+            # Fast path: slice from precomputed IC DataFrames
+            mask_l = (
+                (self._lagged_ic_df.index >= ts_start_ts)
+                & (self._lagged_ic_df.index <= ts_end_ts)
+            )
+            lagged_ic = self._lagged_ic_df.loc[mask_l]
+            mask_f = (
+                (self._forward_ic_df.index >= ts_start_ts)
+                & (self._forward_ic_df.index <= ts_end_ts)
+            )
+            fwd_ic = self._forward_ic_df.loc[mask_f]
+        elif alpha158_df is not None:
             # Direct path: data already in memory — slice to window
             self._alpha158_df = alpha158_df
             labels = load_alpha158_labels(cfg, ts_start, ts_end)
             dt_idx = alpha158_df.index.get_level_values("datetime")
-            mask = (dt_idx >= pd.Timestamp(ts_start)) & (dt_idx <= pd.Timestamp(ts_end))
+            mask = (dt_idx >= ts_start_ts) & (dt_idx <= ts_end_ts)
             windowed = alpha158_df.loc[mask]
             lagged_ic = compute_lagged_factor_ic(
                 windowed, labels, lookback=20, realize_lag=realize_lag
@@ -79,8 +170,8 @@ class FactorTimingModel:
             fwd_ic = self._compute_forward_ic(windowed, labels)
         else:
             # Year-by-year path: only iterate years in [train_start, train_end]
-            start_year = pd.Timestamp(ts_start).year
-            end_year = pd.Timestamp(ts_end).year
+            start_year = ts_start_ts.year
+            end_year = ts_end_ts.year
             print(f"  Computing IC values year-by-year ({start_year}–{end_year})…")
             lagged_ic_parts = []
             fwd_ic_parts = []
@@ -109,13 +200,14 @@ class FactorTimingModel:
             del lagged_ic_parts, fwd_ic_parts
             gc.collect()
 
-        # Store lagged IC for inference lookup
-        if self._lagged_ic_df is None:
-            self._lagged_ic_df = lagged_ic
-        else:
-            self._lagged_ic_df = pd.concat(
-                [self._lagged_ic_df, lagged_ic]
-            ).loc[~pd.concat([self._lagged_ic_df, lagged_ic]).index.duplicated(keep="last")]
+        # Store lagged IC for inference lookup (skip if already precomputed)
+        if not precomputed_ok:
+            if self._lagged_ic_df is None:
+                self._lagged_ic_df = lagged_ic
+            else:
+                self._lagged_ic_df = pd.concat(
+                    [self._lagged_ic_df, lagged_ic]
+                ).loc[~pd.concat([self._lagged_ic_df, lagged_ic]).index.duplicated(keep="last")]
 
         # Merge X
         X = regime_df.join(lagged_ic, how="inner")
