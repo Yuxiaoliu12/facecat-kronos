@@ -36,6 +36,7 @@ class FactorTimingModel:
         self.feature_names: list[str] = []
         self.target_names: list[str] = [f"fwd_ic_{c}" for c in FACTOR_CATEGORIES]
         self._alpha158_df: pd.DataFrame | None = None  # cached
+        self._lagged_ic_df: pd.DataFrame | None = None  # for inference lookup
 
     # ── Training ─────────────────────────────────────────────────────────
 
@@ -63,6 +64,8 @@ class FactorTimingModel:
         if regime_df is None:
             regime_df = load_market_regime_features(cfg, ts_start, ts_end)
 
+        realize_lag = cfg.forward_horizon_days
+
         if alpha158_df is not None:
             # Direct path: data already in memory — slice to window
             self._alpha158_df = alpha158_df
@@ -70,7 +73,9 @@ class FactorTimingModel:
             dt_idx = alpha158_df.index.get_level_values("datetime")
             mask = (dt_idx >= pd.Timestamp(ts_start)) & (dt_idx <= pd.Timestamp(ts_end))
             windowed = alpha158_df.loc[mask]
-            lagged_ic = compute_lagged_factor_ic(windowed, labels, lookback=20)
+            lagged_ic = compute_lagged_factor_ic(
+                windowed, labels, lookback=20, realize_lag=realize_lag
+            )
             fwd_ic = self._compute_forward_ic(windowed, labels)
         else:
             # Year-by-year path: only iterate years in [train_start, train_end]
@@ -89,7 +94,10 @@ class FactorTimingModel:
                     cfg, f"{year}-01-01", f"{year}-12-31"
                 )
                 lagged_ic_parts.append(
-                    compute_lagged_factor_ic(year_df, year_labels, lookback=20)
+                    compute_lagged_factor_ic(
+                        year_df, year_labels, lookback=20,
+                        realize_lag=realize_lag,
+                    )
                 )
                 fwd_ic_parts.append(self._compute_forward_ic(year_df, year_labels))
                 print(f"{len(year_df)} rows")
@@ -100,6 +108,14 @@ class FactorTimingModel:
             fwd_ic = pd.concat(fwd_ic_parts)
             del lagged_ic_parts, fwd_ic_parts
             gc.collect()
+
+        # Store lagged IC for inference lookup
+        if self._lagged_ic_df is None:
+            self._lagged_ic_df = lagged_ic
+        else:
+            self._lagged_ic_df = pd.concat(
+                [self._lagged_ic_df, lagged_ic]
+            ).loc[~pd.concat([self._lagged_ic_df, lagged_ic]).index.duplicated(keep="last")]
 
         # Merge X
         X = regime_df.join(lagged_ic, how="inner")
@@ -210,6 +226,40 @@ class FactorTimingModel:
 
     # ── Inference ────────────────────────────────────────────────────────
 
+    def ensure_lagged_ic(self, years: range):
+        """Extend lagged IC cache to cover the given years (for inference).
+
+        Call after training to make lagged IC available for test dates.
+        """
+        import gc
+
+        realize_lag = self.cfg.forward_horizon_days
+        for year in years:
+            # Skip years already covered
+            if self._lagged_ic_df is not None:
+                existing = self._lagged_ic_df.index
+                year_start = pd.Timestamp(f"{year}-01-01")
+                year_end = pd.Timestamp(f"{year}-12-31")
+                if ((existing >= year_start) & (existing <= year_end)).any():
+                    continue
+
+            year_df = load_alpha158_year(self.cfg, year)
+            if year_df.empty:
+                continue
+            year_labels = load_alpha158_labels(
+                self.cfg, f"{year}-01-01", f"{year}-12-31"
+            )
+            ic_part = compute_lagged_factor_ic(
+                year_df, year_labels, lookback=20, realize_lag=realize_lag,
+            )
+            if self._lagged_ic_df is None:
+                self._lagged_ic_df = ic_part
+            else:
+                combined = pd.concat([self._lagged_ic_df, ic_part])
+                self._lagged_ic_df = combined.loc[~combined.index.duplicated(keep="last")]
+            del year_df, year_labels, ic_part
+            gc.collect()
+
     def score_stocks(
         self,
         date: pd.Timestamp,
@@ -242,6 +292,11 @@ class FactorTimingModel:
         if regime_row is None:
             regime_df = load_market_regime_features(self.cfg, str(date.date()), str(date.date()))
             regime_row = regime_df.iloc[-1] if len(regime_df) > 0 else pd.Series(dtype=float)
+
+        # Merge lagged IC features into regime_row (fixes train-test mismatch)
+        if self._lagged_ic_df is not None and date in self._lagged_ic_df.index:
+            ic_row = self._lagged_ic_df.loc[date]
+            regime_row = pd.concat([regime_row, ic_row])
 
         # Align features
         x = regime_row.reindex(self.feature_names, fill_value=0).values.reshape(1, -1)

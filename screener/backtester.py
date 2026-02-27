@@ -285,6 +285,9 @@ class WalkForwardBacktester:
 
         self.trader.reset()
         layer_outputs = []
+        # Bug fix: signal on day T, trade on day T+1 to avoid look-ahead bias.
+        # Features (Alpha158, technicals) use T's close, so we can't trade at T's open.
+        pending_symbols: list[str] = []
 
         for wi, window in enumerate(windows):
             print(f"\n{'='*60}")
@@ -299,6 +302,11 @@ class WalkForwardBacktester:
             else:
                 self._finetune_layer1(window["train_start"], window["train_end"])
                 self._finetune_layer2(window["train_start"], window["train_end"])
+
+            # Ensure lagged IC covers the test period for Layer 1 inference
+            test_start_year = pd.Timestamp(window["test_start"]).year
+            test_end_year = pd.Timestamp(window["test_end"]).year
+            self.layer1.ensure_lagged_ic(range(test_start_year, test_end_year + 1))
 
             # Load Kronos model once per window (lazy import)
             if run_kronos:
@@ -321,32 +329,39 @@ class WalkForwardBacktester:
                 if verbose and di % 20 == 0:
                     print(f"  Day {di+1}/{len(test_dates)}: {date.date()}")
 
-                # Run pipeline
+                # Run pipeline — generates TODAY's signal (used TOMORROW)
                 pipeline_out = self._run_daily_pipeline(date, run_kronos=run_kronos)
                 layer_outputs.append(pipeline_out)
 
-                # Get today's + prev day's OHLCV for paper trader
+                # Collect OHLCV for paper trader: pending symbols (yesterday's
+                # picks, traded at today's open) + held position
+                trade_symbols = set(pending_symbols)
+                if self.trader.position:
+                    trade_symbols.add(self.trader.position.symbol)
+
                 ohlcv_today = {}
                 ohlcv_prev = {}
-                for sym in set(pipeline_out.get("layer3", []) +
-                               ([self.trader.position.symbol] if self.trader.position else [])):
+                for sym in trade_symbols:
                     df = self._ohlcv.get(sym)
                     if df is None:
                         continue
                     if date in df.index:
                         ohlcv_today[sym] = df.loc[date]
-                    # Previous day
                     prev_dates = df.index[df.index < date]
                     if len(prev_dates) > 0:
                         ohlcv_prev[sym] = df.loc[prev_dates[-1]]
 
-                # Paper trader daily update
+                # Paper trader uses YESTERDAY's signal to buy at today's open
+                # (avoids look-ahead: features used T's close, trade at T+1 open)
                 self.trader.daily_update(
                     date=date,
-                    ranked_symbols=pipeline_out.get("layer3", []),
+                    ranked_symbols=pending_symbols,
                     ohlcv_today=ohlcv_today,
                     ohlcv_prev=ohlcv_prev,
                 )
+
+                # Store today's signal for tomorrow's trading
+                pending_symbols = pipeline_out.get("layer3", [])
 
             # Unload Kronos after each window to save GPU memory
             if run_kronos and self.layer3 is not None:

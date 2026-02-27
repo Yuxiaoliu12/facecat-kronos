@@ -486,6 +486,7 @@ def compute_lagged_factor_ic(
     alpha158_df: pd.DataFrame,
     returns: pd.Series,
     lookback: int = 20,
+    realize_lag: int = 0,
 ) -> pd.DataFrame:
     """Compute rolling IC (Spearman rank correlation) per factor category.
 
@@ -493,12 +494,19 @@ def compute_lagged_factor_ic(
         alpha158_df: Alpha158 features, MultiIndex (datetime, instrument).
         returns: Forward returns, same index as alpha158_df.
         lookback: Rolling window in trading days.
+        realize_lag: Extra shift (in rows) so that only fully realized forward
+            returns contribute.  Set to forward_horizon_days (e.g. 5) to
+            guarantee no look-ahead: IC at date T uses returns[T+1:T+5],
+            so shifting by 5 means lagged_ic at T only includes ICs up to
+            T-5, whose returns are fully known by T.
 
     Returns:
         DataFrame indexed by datetime with one column per factor category.
     """
     ic_df = compute_daily_category_ic(alpha158_df, returns, min_valid=10)
     ic_df = ic_df.rename(columns={c: f"ic_{c}" for c in ic_df.columns})
+    if realize_lag > 0:
+        ic_df = ic_df.shift(realize_lag)
     ic_df = ic_df.fillna(0.0).rolling(lookback, min_periods=5).mean().fillna(0)
     return ic_df
 

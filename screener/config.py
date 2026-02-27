@@ -62,7 +62,7 @@ class ScreenerConfig:
     initial_capital: float = 1_000_000.0
     buy_commission: float = 0.00025       # 0.025%
     sell_commission: float = 0.00025      # 0.025%
-    stamp_tax: float = 0.0005            # 0.05%  (sell only)
+    stamp_tax: float = 0.001             # 0.1% (sell only, pre-Aug-2023; use 0.0005 post-2023)
     max_hold_days: int = 5
     lot_size: int = 100                  # A-share minimum lot
     tp_pct: float = 0.05                 # take-profit threshold (5%)
