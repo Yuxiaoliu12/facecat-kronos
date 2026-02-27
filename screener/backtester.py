@@ -25,6 +25,7 @@ from screener.data_pipeline import (
     load_raw_ohlcv,
     get_calendar,
     _get_ohlcv_cache,
+    _get_benchmark_cache,
 )
 from screener.factor_timing_model import FactorTimingModel
 from screener.technical_ranker import TechnicalRanker
@@ -526,6 +527,331 @@ class WalkForwardBacktester:
         if os.path.exists(path):
             os.remove(path)
             print(f"Checkpoint deleted (run complete) → {path}")
+
+    # ── RL Checkpointing ─────────────────────────────────────────────
+
+    def _rl_checkpoint_path(self) -> str:
+        return os.path.join(self.cfg.run_dir, "rl_checkpoint.pkl")
+
+    def _save_rl_checkpoint(
+        self,
+        wi: int,
+        all_nav: list[tuple],
+        window_results: list[dict],
+    ):
+        """Save RL backtest progress after a completed quarterly window."""
+        ckpt = {
+            "completed_window": wi,
+            "all_nav": all_nav,
+            "window_results": window_results,
+            # L1+L2 model state (needed to generate signals on resume)
+            "layer1_model": self.layer1.model,
+            "layer1_feature_names": self.layer1.feature_names,
+            "layer2_model": self.layer2.model,
+        }
+        path = self._rl_checkpoint_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(ckpt, f)
+        print(f"  RL checkpoint saved (window {wi+1}) → {path}")
+
+    def _load_rl_checkpoint(self) -> dict | None:
+        """Load RL checkpoint if one exists."""
+        path = self._rl_checkpoint_path()
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            ckpt = pickle.load(f)
+        print(
+            f"\n*** Resuming RL backtest from checkpoint "
+            f"(completed window {ckpt['completed_window']+1}) ***"
+        )
+        return ckpt
+
+    def _delete_rl_checkpoint(self):
+        """Remove RL checkpoint file after successful completion."""
+        path = self._rl_checkpoint_path()
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"RL checkpoint deleted (run complete) → {path}")
+
+    # ── RL Backtest ─────────────────────────────────────────────────────
+
+    def _generate_daily_signals(
+        self, start_date: str, end_date: str, verbose: bool = False,
+    ) -> list[dict]:
+        """Run L1→L2 pipeline for each trading day and capture signals.
+
+        Returns list of dicts with keys:
+            date, l2_scores (Series), l2_ranking (list[str]),
+            l2_features (DataFrame symbol × tech features).
+        """
+        dates = self._calendar[
+            (self._calendar >= pd.Timestamp(start_date))
+            & (self._calendar <= pd.Timestamp(end_date))
+        ]
+        signals: list[dict] = []
+        for di, date in enumerate(dates):
+            if verbose and di % 50 == 0:
+                print(f"  Signals {di+1}/{len(dates)}: {date.date()}")
+
+            # Layer 1 — factor timing → top 200
+            try:
+                regime_row = (
+                    self._regime.loc[date] if date in self._regime.index else None
+                )
+                l1_picks = self.layer1.select_top(
+                    date, alpha158_df=self._alpha158, regime_row=regime_row
+                )
+            except Exception:
+                l1_picks = []
+
+            if not l1_picks:
+                # Still emit a signal (agent may be holding stocks)
+                signals.append({
+                    "date": date,
+                    "l2_scores": pd.Series(dtype=float),
+                    "l2_ranking": [],
+                    "l2_features": pd.DataFrame(),
+                })
+                continue
+
+            # Layer 2 — ranking + features
+            try:
+                l2_scores = self.layer2.rank_stocks(
+                    self._ohlcv, l1_picks, date, include_news=False
+                )
+                l2_ranking = list(l2_scores.index)  # sorted desc
+                l2_features = self.layer2.compute_features_for_stocks(
+                    self._ohlcv, date=date, symbols=l1_picks, include_news=False
+                )
+            except Exception:
+                l2_scores = pd.Series(dtype=float)
+                l2_ranking = l1_picks[: self.cfg.layer2_top_n]
+                l2_features = pd.DataFrame()
+
+            signals.append({
+                "date": date,
+                "l2_scores": l2_scores,
+                "l2_ranking": l2_ranking,
+                "l2_features": l2_features,
+            })
+
+        return signals
+
+    def run_rl(self, verbose: bool = True) -> dict:
+        """Walk-forward backtest using the RL portfolio agent.
+
+        Same window schedule as run() but replaces the paper trader with
+        a DQN agent trained on PortfolioEnv.  Checkpoints after each
+        completed window so the run can resume after disconnects.
+
+        Returns dict with keys: metrics, nav_series, window_results.
+        """
+        from screener.portfolio_env import PortfolioEnv
+        from screener.rl_trader import RLTrader
+
+        if self._ohlcv is None:
+            self.load_data()
+
+        windows = self._generate_retrain_windows()
+        print(f"\nRL Backtest windows: {len(windows)}")
+        for w in windows:
+            print(
+                f"  [{w['mode']:>8}] Train:{w['train_start']}→{w['train_end']}  "
+                f"Test:{w['test_start']}→{w['test_end']}"
+            )
+
+        benchmark_df = _get_benchmark_cache(self.cfg)
+        rl_trader = RLTrader(self.cfg)
+
+        # Check for existing checkpoint to resume from
+        rl_ckpt = self._load_rl_checkpoint()
+        if rl_ckpt is not None:
+            resume_from = rl_ckpt["completed_window"] + 1
+            all_nav = rl_ckpt["all_nav"]
+            window_results = rl_ckpt["window_results"]
+            self.layer1.model = rl_ckpt["layer1_model"]
+            self.layer1.feature_names = rl_ckpt["layer1_feature_names"]
+            self.layer2.model = rl_ckpt["layer2_model"]
+            print(f"Skipping windows 1..{resume_from}, resuming at window {resume_from+1}")
+        else:
+            resume_from = 0
+            all_nav: list[tuple[pd.Timestamp, float]] = []
+            window_results: list[dict] = []
+
+        for wi, window in enumerate(windows):
+            if wi < resume_from:
+                continue
+
+            print(f"\n{'='*60}")
+            print(
+                f"Window {wi+1}/{len(windows)} [{window['mode']}]: "
+                f"test {window['test_start']} → {window['test_end']}"
+            )
+            print(f"{'='*60}")
+
+            # ── Train / fine-tune L1+L2 ───────────────────────────────
+            if window["mode"] == "initial":
+                self._train_layer1(window["train_start"], window["train_end"])
+                self._train_layer2(window["train_start"], window["train_end"])
+            else:
+                self._finetune_layer1(window["train_start"], window["train_end"])
+                self._finetune_layer2(window["train_start"], window["train_end"])
+
+            # Ensure lagged IC covers test period
+            test_start_year = pd.Timestamp(window["test_start"]).year
+            test_end_year = pd.Timestamp(window["test_end"]).year
+            self.layer1.ensure_lagged_ic(range(test_start_year, test_end_year + 1))
+
+            # ── Generate signals ──────────────────────────────────────
+            print("\n  Generating training signals…")
+            train_signals = self._generate_daily_signals(
+                window["train_start"], window["train_end"], verbose=verbose
+            )
+            print(f"  Training signals: {len(train_signals)} days")
+
+            print("  Generating test signals…")
+            test_signals = self._generate_daily_signals(
+                window["test_start"], window["test_end"], verbose=verbose
+            )
+            print(f"  Test signals: {len(test_signals)} days")
+
+            if len(train_signals) < 20:
+                print("  Skipping window (insufficient training signals)")
+                self._save_rl_checkpoint(wi, all_nav, window_results)
+                continue
+
+            # ── Train DQN ─────────────────────────────────────────────
+            print("\n  Training DQN agent…")
+            train_env = PortfolioEnv(
+                self.cfg, train_signals, self._ohlcv,
+                benchmark_df, training_mode=True,
+            )
+            model = rl_trader.train(train_env)
+
+            # Save model
+            model_path = os.path.join(
+                self.cfg.run_dir, f"rl_model_window_{wi}"
+            )
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            rl_trader.save(model, model_path)
+            print(f"  Model saved → {model_path}")
+
+            # ── Inference on test period ──────────────────────────────
+            if len(test_signals) == 0:
+                print("  Skipping inference (no test signals)")
+                self._save_rl_checkpoint(wi, all_nav, window_results)
+                continue
+
+            print("\n  Running inference…")
+            test_env = PortfolioEnv(
+                self.cfg, test_signals, self._ohlcv,
+                benchmark_df, training_mode=False,
+            )
+            obs, _ = test_env.reset()
+            total_reward = 0.0
+            blocked_count = 0
+
+            for step_i in range(len(test_signals) - 1):
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = test_env.step(
+                    int(action)
+                )
+                total_reward += reward
+                blocked_count += len(info.get("blocked_trades", []))
+                if terminated or truncated:
+                    break
+
+            # Collect NAV
+            test_nav = test_env._nav_history
+            test_dates = [s["date"] for s in test_signals]
+            for j, nav_val in enumerate(test_nav):
+                if j < len(test_dates):
+                    all_nav.append((test_dates[j], nav_val))
+
+            test_return = (
+                test_nav[-1] / test_nav[0] - 1 if len(test_nav) > 1 else 0.0
+            )
+            wr = {
+                "window": wi,
+                "test_start": window["test_start"],
+                "test_end": window["test_end"],
+                "test_return": float(test_return),
+                "total_reward": float(total_reward),
+                "blocked_trades": blocked_count,
+                "final_nav": float(test_nav[-1]) if test_nav else 0.0,
+            }
+            window_results.append(wr)
+            print(
+                f"  Window return: {test_return*100:.2f}%  "
+                f"Final NAV: {test_nav[-1]:,.0f}  "
+                f"Blocked: {blocked_count}"
+            )
+
+            # Checkpoint after each completed window
+            self._save_rl_checkpoint(wi, all_nav, window_results)
+
+        # ── Aggregate results ─────────────────────────────────────────
+        if all_nav:
+            nav_series = pd.Series(
+                {d: v for d, v in all_nav}, name="nav"
+            ).sort_index()
+        else:
+            nav_series = pd.Series(dtype=float, name="nav")
+
+        metrics = self._compute_rl_metrics(nav_series)
+
+        print(f"\n{'='*60}")
+        print("RL BACKTEST RESULTS")
+        print(f"{'='*60}")
+        for k, v in metrics.items():
+            print(
+                f"  {k:>20}: {v:.4f}"
+                if isinstance(v, float)
+                else f"  {k:>20}: {v}"
+            )
+
+        # Run complete — remove checkpoint
+        self._delete_rl_checkpoint()
+
+        return {
+            "metrics": metrics,
+            "nav_series": nav_series,
+            "window_results": window_results,
+        }
+
+    @staticmethod
+    def _compute_rl_metrics(nav_series: pd.Series) -> dict:
+        """Compute performance metrics from a NAV series."""
+        if len(nav_series) < 2:
+            return {
+                "total_return": 0.0,
+                "sharpe": 0.0,
+                "max_drawdown": 0.0,
+                "n_days": len(nav_series),
+            }
+
+        total_return = float(nav_series.iloc[-1] / nav_series.iloc[0] - 1)
+        daily_returns = nav_series.pct_change().dropna()
+
+        if daily_returns.std() > 0:
+            sharpe = float(
+                daily_returns.mean() / daily_returns.std() * np.sqrt(252)
+            )
+        else:
+            sharpe = 0.0
+
+        cummax = nav_series.cummax()
+        drawdown = (nav_series - cummax) / cummax
+        max_dd = float(drawdown.min())
+
+        return {
+            "total_return": total_return,
+            "sharpe": sharpe,
+            "max_drawdown": max_dd,
+            "n_days": len(nav_series),
+        }
 
     # ── Persistence ──────────────────────────────────────────────────────
 
