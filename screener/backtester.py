@@ -680,7 +680,7 @@ class WalkForwardBacktester:
         """Walk-forward backtest using the RL portfolio agent.
 
         Same window schedule as run() but replaces the paper trader with
-        a DQN agent trained on PortfolioEnv.  Checkpoints after each
+        a MaskablePPO agent trained on PortfolioEnv.  Checkpoints after each
         completed window so the run can resume after disconnects.
 
         Returns dict with keys: metrics, nav_series, window_results.
@@ -772,8 +772,8 @@ class WalkForwardBacktester:
                 self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
                 continue
 
-            # ── Train DQN ─────────────────────────────────────────────
-            print("\n  Training DQN agent…")
+            # ── Train PPO ─────────────────────────────────────────────
+            print("\n  Training PPO agent…")
             train_env = PortfolioEnv(
                 self.cfg, train_signals, self._ohlcv,
                 benchmark_df, training_mode=True,
@@ -795,17 +795,24 @@ class WalkForwardBacktester:
                 continue
 
             print("\n  Running inference…")
+            from sb3_contrib.common.wrappers import ActionMasker
+            from sb3_contrib.common.maskable.utils import get_action_masks
+
             test_env = PortfolioEnv(
                 self.cfg, test_signals, self._ohlcv,
                 benchmark_df, training_mode=False,
             )
-            obs, _ = test_env.reset()
+            masked_test_env = ActionMasker(test_env, lambda e: e.action_masks())
+            obs, _ = masked_test_env.reset()
             total_reward = 0.0
             blocked_count = 0
 
             for step_i in range(len(test_signals) - 1):
-                action, _ = model.predict(obs, deterministic=True)
-                obs, reward, terminated, truncated, info = test_env.step(
+                masks = get_action_masks(masked_test_env)
+                action, _ = model.predict(
+                    obs, deterministic=True, action_masks=masks
+                )
+                obs, reward, terminated, truncated, info = masked_test_env.step(
                     int(action)
                 )
                 total_reward += reward

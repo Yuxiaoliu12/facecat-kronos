@@ -1,10 +1,11 @@
 """
 Layer 4: RL Portfolio Environment (Gymnasium)
 
-DQN environment for 3-stock portfolio management with discrete position
+PPO environment for 3-stock portfolio management with discrete position
 sizing and per-stock execution timing.  Uses L2 screening signals as
 observations and enforces A-share trading constraints (T+1, limit-up/down,
-suspension, 一字板).
+suspension, 一字板).  Supports action masking via ``action_masks()`` for
+use with sb3-contrib MaskablePPO.
 """
 
 import random
@@ -59,11 +60,11 @@ def build_action_table(n_slots: int = 3, weight_steps: int = 3) -> list[tuple]:
 # ── Environment ───────────────────────────────────────────────────────────────
 
 class PortfolioEnv(gymnasium.Env):
-    """DQN environment for 3-stock portfolio management.
+    """PPO environment for 3-stock portfolio management with action masking.
 
     Action:  index into precomputed table of (weight, timing) combos.
     Obs:     per-slot features (11 each) + global features (4) = 37 dims.
-    Reward:  rolling 5-day log return × 100.
+    Reward:  rolling 5-day log return × 10.
     """
 
     metadata = {"render_modes": []}
@@ -345,6 +346,109 @@ class PortfolioEnv(gymnasium.Env):
 
         return slots
 
+    # ── Action Masking ─────────────────────────────────────────────────
+
+    def action_masks(self) -> np.ndarray:
+        """Boolean mask over all actions. Called BEFORE step().
+
+        Agent observes day T (self._day_idx = T).
+        Execution happens on day T+1.
+        """
+        n_actions = len(self._action_table)
+        mask = np.ones(n_actions, dtype=bool)
+
+        # If no next day to execute on, allow everything (episode ends)
+        exec_idx = self._day_idx + 1
+        if exec_idx >= len(self._daily_signals):
+            return mask
+
+        exec_date = self._daily_signals[exec_idx]["date"]
+        slots = list(self._active_slots)
+
+        for act_i, action in enumerate(self._action_table):
+            weights = action[: self._n_slots]
+            timings = action[self._n_slots :]
+
+            legal = True
+            for slot_i in range(self._n_slots):
+                sym = slots[slot_i]
+                tw = weights[slot_i]
+                timing = timings[slot_i]
+                is_held = sym is not None and sym in self._holdings
+
+                if sym is None and tw > 0:
+                    # No stock in slot, but action wants positive weight
+                    legal = False
+                    break
+
+                if sym is not None and not is_held and tw > 0:
+                    # Need to buy — check constraints
+                    t = timing if timing is not None else "open"
+                    if not self._can_buy(sym, exec_date, t):
+                        legal = False
+                        break
+
+                if is_held and tw == 0:
+                    # Need to sell — check constraints (T+1 uses hold_days+1
+                    # because hold_days increments at the start of step())
+                    h = self._holdings[sym]
+                    if h["hold_days"] < 0:
+                        # Should not happen, but guard
+                        legal = False
+                        break
+                    t = timing if timing is not None else "close"
+                    if not self._can_sell_on_next_day(sym, exec_date, t):
+                        legal = False
+                        break
+
+            if not legal:
+                mask[act_i] = False
+
+        # Fallback: if ALL masked, unmask everything (let step() handle it)
+        if not mask.any():
+            mask[:] = True
+
+        return mask
+
+    def _can_sell_on_next_day(
+        self, symbol: str, date: pd.Timestamp, timing: str
+    ) -> bool:
+        """Like _can_sell but accounts for hold_days incrementing in step().
+
+        At mask time, hold_days hasn't been incremented yet.  The actual
+        sell happens after hold_days += 1, so we check hold_days >= 0
+        (i.e., after increment it will be >= 1 → T+1 satisfied).
+        """
+        h = self._holdings.get(symbol)
+        if h and h["hold_days"] < 0:
+            return False  # bought today, T+1 blocks
+        # hold_days >= 0 means after +1 it will be >= 1 → T+1 OK
+
+        ohlcv = self._ohlcv_dict.get(symbol)
+        if ohlcv is None or date not in ohlcv.index:
+            return False
+        row = ohlcv.loc[date]
+
+        # Suspension
+        vol = row.get("volume", row.get("vol", 0))
+        if vol <= 0:
+            return False
+
+        # 一字板 — can't sell
+        if self._is_yizi_ban(row):
+            return False
+
+        prev_close = self._get_prev_close(symbol, date)
+        if prev_close is None:
+            return True
+
+        # Limit down at execution price
+        price = row["open"] if timing == "open" else row["close"]
+        if self._is_limit_down(symbol, price, prev_close):
+            return False
+
+        return True
+
     # ── Observation Builder ───────────────────────────────────────────
 
     def _build_obs(self) -> np.ndarray:
@@ -380,14 +484,27 @@ class PortfolioEnv(gymnasium.Env):
             if sym in l2_scores_z.index:
                 obs[off] = float(l2_scores_z[sym])
 
-            # 2-7. Tech features
+            # 2-7. Tech features (normalised to ~[-1, 1])
             if sym in l2_features.index:
                 row = l2_features.loc[sym]
+                close_price = self._get_price(sym, date, "close")
                 for j, feat in enumerate(_SLOT_TECH_FEATURES):
                     val = row.get(feat, 0.0)
-                    if feat == "rsi_14":
-                        val = val / 100.0
-                    obs[off + 1 + j] = 0.0 if (val != val) else float(val)  # NaN check
+                    if val != val:  # NaN check
+                        val = 0.0
+                    else:
+                        val = float(val)
+                        if feat == "rsi_14":
+                            val = val / 100.0                        # [0, 1]
+                        elif feat in ("mom_5", "mom_20"):
+                            val = np.clip(val, -0.3, 0.3) / 0.3     # [-1, 1]
+                        elif feat == "atr_14":
+                            if close_price and close_price > 0:
+                                val = val / close_price              # relative ATR
+                            val = np.clip(val, 0.0, 0.1) * 10.0     # [0, 1]
+                        elif feat == "volume_trend":
+                            val = np.clip(val, -2.0, 2.0) / 2.0     # [-1, 1]
+                    obs[off + 1 + j] = val
 
             # 8-11. Position features
             h = self._holdings.get(sym)
@@ -397,7 +514,8 @@ class PortfolioEnv(gymnasium.Env):
                 obs[off + 9] = min(h["hold_days"] / 20.0, 1.0)  # hold_days_norm
                 cp = self._get_price(sym, date, "close")
                 if cp and h["entry_price"] > 0:
-                    obs[off + 10] = cp / h["entry_price"] - 1.0  # unrealised PnL
+                    pnl = cp / h["entry_price"] - 1.0
+                    obs[off + 10] = np.clip(pnl, -0.5, 0.5) / 0.5  # [-1, 1]
 
         # Global features
         g = self._n_slots * _N_SLOT_FEATURES
@@ -416,14 +534,14 @@ class PortfolioEnv(gymnasium.Env):
     # ── Reward ────────────────────────────────────────────────────────
 
     def _compute_reward(self) -> float:
-        """Rolling 5-day log return × 100."""
+        """Rolling 5-day log return × 10."""
         t = len(self._nav_history) - 1
         w = self.cfg.rl_reward_window
         t_ref = max(0, t - w)
         nav_ref = self._nav_history[t_ref]
         if nav_ref <= 0 or self._nav <= 0:
             return 0.0
-        return 100.0 * float(np.log(self._nav / nav_ref))
+        return 10.0 * float(np.log(self._nav / nav_ref))
 
     # ── Price Helpers ─────────────────────────────────────────────────
 

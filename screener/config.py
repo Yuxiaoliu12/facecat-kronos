@@ -73,18 +73,18 @@ class ScreenerConfig:
     limit_gem_star: float = 0.20  # 创业板 / 科创板
     limit_ipo_gem_star: float = 0.30  # first 5 days IPO on 创业板/科创板
 
-    # ── Layer 4 — RL Portfolio Agent ──────────────────────────────────────
+    # ── Layer 4 — RL Portfolio Agent (MaskablePPO) ────────────────────────
     rl_n_slots: int = 3                     # max concurrent positions
     rl_weight_steps: int = 3                # weight granularity (1/N increments)
     rl_reward_window: int = 5               # rolling return window for reward
-    rl_total_timesteps: int = 50_000        # DQN training steps per window
-    rl_buffer_size: int = 50_000            # replay buffer size
-    rl_learning_rate: float = 1e-4
+    rl_total_timesteps: int = 50_000        # PPO training steps per window
+    rl_learning_rate: float = 3e-4          # PPO default
     rl_batch_size: int = 64
-    rl_gamma: float = 0.99
-    rl_exploration_fraction: float = 0.3    # fraction of training for epsilon decay
-    rl_exploration_final_eps: float = 0.05
-    rl_target_update_interval: int = 1000
+    rl_gamma: float = 0.95                  # shorter planning horizon (was 0.99)
+    rl_n_steps: int = 512                   # rollout buffer (~1 episode)
+    rl_n_epochs: int = 10                   # SGD passes per rollout
+    rl_clip_range: float = 0.2              # PPO clipping
+    rl_ent_coef: float = 0.01              # entropy bonus (exploration)
     rl_net_arch: list = field(default_factory=lambda: [128, 64])
     rl_train_candidate_mode: str = "random" # "random" | "top"
 

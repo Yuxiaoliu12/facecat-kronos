@@ -1,8 +1,8 @@
 """
-Layer 4: RL Portfolio Trader (DQN wrapper)
+Layer 4: RL Portfolio Trader (MaskablePPO wrapper)
 
-Thin wrapper around Stable Baselines 3 DQN for training, saving, and
-loading portfolio agents.  Depends on ``stable-baselines3`` and ``gymnasium``.
+Thin wrapper around sb3-contrib MaskablePPO for training, saving, and
+loading portfolio agents.  Depends on ``sb3-contrib`` and ``gymnasium``.
 """
 
 from __future__ import annotations
@@ -12,18 +12,25 @@ import time
 from screener.config import ScreenerConfig
 
 
+def _mask_fn(env):
+    """Extract action masks from the underlying PortfolioEnv."""
+    return env.action_masks()
+
+
 class RLTrader:
-    """Train and run a DQN agent for portfolio management."""
+    """Train and run a MaskablePPO agent for portfolio management."""
 
     def __init__(self, cfg: ScreenerConfig):
         self.cfg = cfg
 
     def train(self, env):
-        """Train a DQN model on the given PortfolioEnv.
+        """Train a MaskablePPO model on the given PortfolioEnv.
 
-        Returns the trained SB3 DQN model.
+        Wraps the env with ActionMasker so illegal actions are masked
+        during rollout collection.  Returns the trained model.
         """
-        from stable_baselines3 import DQN
+        from sb3_contrib import MaskablePPO
+        from sb3_contrib.common.wrappers import ActionMasker
         from stable_baselines3.common.callbacks import BaseCallback
 
         total_steps = self.cfg.rl_total_timesteps
@@ -40,29 +47,30 @@ class RLTrader:
                 if self.num_timesteps >= self._next_log:
                     elapsed = time.time() - self._t0
                     fps = self.num_timesteps / max(elapsed, 1)
-                    ep_info = self.locals.get("infos", [{}])
                     loss = self.model.logger.name_to_value.get(
-                        "train/loss", float("nan")
+                        "train/policy_gradient_loss", float("nan")
                     )
                     print(
-                        f"    DQN {self.num_timesteps:>6}/{total_steps} "
+                        f"    PPO {self.num_timesteps:>6}/{total_steps} "
                         f"({elapsed:.0f}s, {fps:.0f}fps) "
-                        f"loss={loss:.2f}"
+                        f"pg_loss={loss:.4f}"
                     )
                     self._next_log += 10_000
                 return True
 
+        masked_env = ActionMasker(env, _mask_fn)
+
         t0 = time.time()
-        model = DQN(
+        model = MaskablePPO(
             "MlpPolicy",
-            env,
+            masked_env,
             learning_rate=self.cfg.rl_learning_rate,
-            buffer_size=self.cfg.rl_buffer_size,
+            n_steps=self.cfg.rl_n_steps,
             batch_size=self.cfg.rl_batch_size,
+            n_epochs=self.cfg.rl_n_epochs,
             gamma=self.cfg.rl_gamma,
-            exploration_fraction=self.cfg.rl_exploration_fraction,
-            exploration_final_eps=self.cfg.rl_exploration_final_eps,
-            target_update_interval=self.cfg.rl_target_update_interval,
+            clip_range=self.cfg.rl_clip_range,
+            ent_coef=self.cfg.rl_ent_coef,
             policy_kwargs=dict(net_arch=self.cfg.rl_net_arch),
             verbose=0,
         )
@@ -71,17 +79,17 @@ class RLTrader:
             callback=_ProgressCallback(),
         )
         elapsed = time.time() - t0
-        print(f"    DQN training complete: {total_steps} steps in {elapsed:.0f}s")
+        print(f"    PPO training complete: {total_steps} steps in {elapsed:.0f}s")
         return model
 
     @staticmethod
     def save(model, path: str):
-        """Save a trained DQN model to disk."""
+        """Save a trained MaskablePPO model to disk."""
         model.save(path)
 
     @staticmethod
     def load(path: str):
-        """Load a DQN model from disk."""
-        from stable_baselines3 import DQN
+        """Load a MaskablePPO model from disk."""
+        from sb3_contrib import MaskablePPO
 
-        return DQN.load(path)
+        return MaskablePPO.load(path)
