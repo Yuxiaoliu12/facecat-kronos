@@ -573,12 +573,14 @@ class WalkForwardBacktester:
         wi: int,
         all_nav: list[tuple],
         window_results: list[dict],
+        running_capital: float = 0.0,
     ):
         """Save RL backtest progress after a completed quarterly window."""
         ckpt = {
             "completed_window": wi,
             "all_nav": all_nav,
             "window_results": window_results,
+            "running_capital": running_capital,
             # L1+L2 model state (needed to generate signals on resume)
             "layer1_model": self.layer1.model,
             "layer1_feature_names": self.layer1.feature_names,
@@ -683,6 +685,15 @@ class WalkForwardBacktester:
 
         Returns dict with keys: metrics, nav_series, window_results.
         """
+        import warnings
+
+        # Suppress noisy warnings from jupyter_client / gym / xgboost
+        warnings.filterwarnings("ignore", module="jupyter_client")
+        warnings.filterwarnings("ignore", message=".*Gym has been unmaintained.*")
+        warnings.filterwarnings(
+            "ignore", message=".*Falling back to prediction using DMatrix.*"
+        )
+
         from screener.portfolio_env import PortfolioEnv
         from screener.rl_trader import RLTrader
 
@@ -706,6 +717,7 @@ class WalkForwardBacktester:
             resume_from = rl_ckpt["completed_window"] + 1
             all_nav = rl_ckpt["all_nav"]
             window_results = rl_ckpt["window_results"]
+            running_capital = rl_ckpt["running_capital"]
             self.layer1.model = rl_ckpt["layer1_model"]
             self.layer1.feature_names = rl_ckpt["layer1_feature_names"]
             self.layer2.model = rl_ckpt["layer2_model"]
@@ -714,6 +726,7 @@ class WalkForwardBacktester:
             resume_from = 0
             all_nav: list[tuple[pd.Timestamp, float]] = []
             window_results: list[dict] = []
+            running_capital: float = float(self.cfg.initial_capital)
 
         for wi, window in enumerate(windows):
             if wi < resume_from:
@@ -756,7 +769,7 @@ class WalkForwardBacktester:
 
             if len(train_signals) < 20:
                 print("  Skipping window (insufficient training signals)")
-                self._save_rl_checkpoint(wi, all_nav, window_results)
+                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
                 continue
 
             # ── Train DQN ─────────────────────────────────────────────
@@ -778,7 +791,7 @@ class WalkForwardBacktester:
             # ── Inference on test period ──────────────────────────────
             if len(test_signals) == 0:
                 print("  Skipping inference (no test signals)")
-                self._save_rl_checkpoint(wi, all_nav, window_results)
+                self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
                 continue
 
             print("\n  Running inference…")
@@ -800,16 +813,20 @@ class WalkForwardBacktester:
                 if terminated or truncated:
                     break
 
-            # Collect NAV
+            # Collect NAV — scale to running capital for continuity
             test_nav = test_env._nav_history
             test_dates = [s["date"] for s in test_signals]
+            scale = (
+                running_capital / test_nav[0] if test_nav[0] > 0 else 1.0
+            )
             for j, nav_val in enumerate(test_nav):
                 if j < len(test_dates):
-                    all_nav.append((test_dates[j], nav_val))
+                    all_nav.append((test_dates[j], nav_val * scale))
 
             test_return = (
                 test_nav[-1] / test_nav[0] - 1 if len(test_nav) > 1 else 0.0
             )
+            running_capital = test_nav[-1] * scale  # carry over
             wr = {
                 "window": wi,
                 "test_start": window["test_start"],
@@ -817,17 +834,17 @@ class WalkForwardBacktester:
                 "test_return": float(test_return),
                 "total_reward": float(total_reward),
                 "blocked_trades": blocked_count,
-                "final_nav": float(test_nav[-1]) if test_nav else 0.0,
+                "final_nav": float(running_capital),
             }
             window_results.append(wr)
             print(
                 f"  Window return: {test_return*100:.2f}%  "
-                f"Final NAV: {test_nav[-1]:,.0f}  "
+                f"Final NAV: {running_capital:,.0f}  "
                 f"Blocked: {blocked_count}"
             )
 
             # Checkpoint after each completed window
-            self._save_rl_checkpoint(wi, all_nav, window_results)
+            self._save_rl_checkpoint(wi, all_nav, window_results, running_capital)
 
         # ── Aggregate results ─────────────────────────────────────────
         if all_nav:
