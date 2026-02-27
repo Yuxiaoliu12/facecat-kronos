@@ -6,8 +6,10 @@ quarterly fine-tuning (warm-start XGBoost).  No lookahead bias.
 Reports layer attribution and comparison benchmarks.
 """
 
+import json
 import os
 import pickle
+from dataclasses import asdict
 from datetime import datetime
 
 import numpy as np
@@ -440,9 +442,22 @@ class WalkForwardBacktester:
     # ── Persistence ──────────────────────────────────────────────────────
 
     def save_results(self, results: dict, path: str | None = None):
-        """Save backtest results to disk."""
-        path = path or os.path.join(self.cfg.drive_root, "backtest_results.pkl")
+        """Save backtest results and run config to disk."""
+        run_dir = self.cfg.run_dir
+        path = path or os.path.join(run_dir, "backtest_results.pkl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(results, f)
         print(f"Results saved → {path}")
+
+        # Save run config for provenance
+        config_path = os.path.join(run_dir, "run_config.json")
+        cfg_dict = asdict(self.cfg)
+        # Convert non-serialisable values
+        for k, v in cfg_dict.items():
+            if isinstance(v, (list, dict, str, int, float, bool, type(None))):
+                continue
+            cfg_dict[k] = str(v)
+        with open(config_path, "w") as f:
+            json.dump(cfg_dict, f, indent=2)
+        print(f"Config saved → {config_path}")

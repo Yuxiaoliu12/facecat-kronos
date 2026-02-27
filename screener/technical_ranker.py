@@ -184,7 +184,7 @@ class TechnicalRanker:
         Stores results in self._feature_cache for O(1) lookup by (symbol, date).
         Uses disk cache to avoid recomputation across runtime restarts.
         """
-        cache_path = os.path.join(self.cfg.model_cache, "layer2_feature_cache.pkl")
+        cache_path = os.path.join(self.cfg.cache_dir, "layer2_feature_cache.pkl")
 
         if os.path.exists(cache_path):
             print(f"Loading Layer 2 feature cache from {cache_path}…", flush=True)

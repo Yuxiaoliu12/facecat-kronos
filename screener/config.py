@@ -63,9 +63,9 @@ class ScreenerConfig:
     buy_commission: float = 0.00025       # 0.025%
     sell_commission: float = 0.00025      # 0.025%
     stamp_tax: float = 0.001             # 0.1% (sell only, pre-Aug-2023; use 0.0005 post-2023)
-    max_hold_days: int = 5
+    max_hold_days: int = 10
     lot_size: int = 100                  # A-share minimum lot
-    tp_pct: float = 0.05                 # take-profit threshold (5%)
+    tp_pct: float = 0.12                 # take-profit threshold (12%)
     sl_pct: float = 0.05                 # stop-loss threshold (5%)
 
     # Limit-up/down thresholds by board
@@ -75,7 +75,7 @@ class ScreenerConfig:
 
     # ── Walk-Forward Settings ─────────────────────────────────────────────
     backtest_start: str = "2017-01-01"
-    backtest_end: str = "2017-12-31"
+    backtest_end: str = "2025-12-31"
     train_years: int = 2                    # initial rolling window size
     forward_horizon_days: int = 5           # leakage trim (drop last N train rows)
     retrain_freq: str = "Q"                 # quarterly
@@ -93,6 +93,7 @@ class ScreenerConfig:
 
     # ── Persistence ──────────────────────────────────────────────────────
     drive_root: str = "output/screener"
+    run_id: str = ""            # auto-set to YYYYMMDD_HHMMSS in __post_init__
     alpha158_cache: str = ""    # auto-set in __post_init__
     model_cache: str = ""       # auto-set in __post_init__
 
@@ -107,11 +108,24 @@ class ScreenerConfig:
         "财政", "证监会", "银保监", "国务院", "发改委",
     ])
 
+    @property
+    def cache_dir(self) -> str:
+        return os.path.join(self.drive_root, "cache")
+
+    @property
+    def run_dir(self) -> str:
+        return os.path.join(self.drive_root, "runs", self.run_id)
+
     def __post_init__(self):
+        from datetime import datetime as _dt
         import pandas as pd
 
-        self.alpha158_cache = os.path.join(self.drive_root, "alpha158_cache.pkl")
-        self.model_cache = os.path.join(self.drive_root, "models")
+        # Auto-generate timestamped run_id
+        if not self.run_id:
+            self.run_id = _dt.now().strftime("%Y%m%d_%H%M%S")
+
+        self.alpha158_cache = os.path.join(self.cache_dir, "alpha158_cache.pkl")
+        self.model_cache = os.path.join(self.run_dir, "models")
         if not self.kronos_tokenizer_path:
             self.kronos_tokenizer_path = os.path.join(self.drive_root, "models", "kronos_tokenizer")
         if not self.kronos_predictor_path:

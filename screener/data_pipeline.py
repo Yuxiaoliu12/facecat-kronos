@@ -244,8 +244,7 @@ def _compute_year_chunk(
 
 def _alpha158_year_path(cfg: ScreenerConfig, year: int) -> str:
     """Path to a single year's Alpha158 cache file."""
-    cache_dir = os.path.dirname(cfg.alpha158_cache) or "."
-    return os.path.join(cache_dir, f"_alpha158_chunk_{year}.pkl")
+    return os.path.join(cfg.cache_dir, f"_alpha158_chunk_{year}.pkl")
 
 
 def _ensure_alpha158_years(cfg: ScreenerConfig, start_year: int, end_year: int):
@@ -253,8 +252,7 @@ def _ensure_alpha158_years(cfg: ScreenerConfig, start_year: int, end_year: int):
     import gc
 
     ohlcv = _get_ohlcv_cache(cfg)
-    cache_dir = os.path.dirname(cfg.alpha158_cache) or "."
-    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(cfg.cache_dir, exist_ok=True)
 
     for year in range(start_year, end_year + 1):
         path = _alpha158_year_path(cfg, year)
