@@ -321,13 +321,15 @@ class WalkForwardBacktester:
                   f"test {window['test_start']} → {window['test_end']}")
             print(f"{'='*60}")
 
-            # Train or fine-tune models
-            if window["mode"] == "initial":
-                self._train_layer1(window["train_start"], window["train_end"])
-                self._train_layer2(window["train_start"], window["train_end"])
-            else:
-                self._finetune_layer1(window["train_start"], window["train_end"])
-                self._finetune_layer2(window["train_start"], window["train_end"])
+            # Train or fine-tune models (skip if cached from a previous run)
+            if not self._load_window_models(wi):
+                if window["mode"] == "initial":
+                    self._train_layer1(window["train_start"], window["train_end"])
+                    self._train_layer2(window["train_start"], window["train_end"])
+                else:
+                    self._finetune_layer1(window["train_start"], window["train_end"])
+                    self._finetune_layer2(window["train_start"], window["train_end"])
+                self._save_window_models(wi)
 
             # Ensure lagged IC covers the test period for Layer 1 inference
             test_start_year = pd.Timestamp(window["test_start"]).year
@@ -528,6 +530,39 @@ class WalkForwardBacktester:
             os.remove(path)
             print(f"Checkpoint deleted (run complete) → {path}")
 
+    # ── Per-Window Model Cache ────────────────────────────────────────
+    # Persists L1+L2 model state per window in cache_dir so that
+    # repeated runs (or run_rl after run) skip redundant training.
+
+    def _window_model_cache_path(self, wi: int) -> str:
+        return os.path.join(
+            self.cfg.cache_dir, "l1l2_models", f"window_{wi}.pkl"
+        )
+
+    def _save_window_models(self, wi: int):
+        path = self._window_model_cache_path(wi)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump({
+                "layer1_model": self.layer1.model,
+                "layer1_feature_names": self.layer1.feature_names,
+                "layer2_model": self.layer2.model,
+            }, f)
+        print(f"  L1+L2 models cached (window {wi+1}) → {path}")
+
+    def _load_window_models(self, wi: int) -> bool:
+        """Load cached L1+L2 models for a window. Returns True if loaded."""
+        path = self._window_model_cache_path(wi)
+        if not os.path.exists(path):
+            return False
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        self.layer1.model = data["layer1_model"]
+        self.layer1.feature_names = data["layer1_feature_names"]
+        self.layer2.model = data["layer2_model"]
+        print(f"  L1+L2 models loaded from cache (window {wi+1})")
+        return True
+
     # ── RL Checkpointing ─────────────────────────────────────────────
 
     def _rl_checkpoint_path(self) -> str:
@@ -691,13 +726,15 @@ class WalkForwardBacktester:
             )
             print(f"{'='*60}")
 
-            # ── Train / fine-tune L1+L2 ───────────────────────────────
-            if window["mode"] == "initial":
-                self._train_layer1(window["train_start"], window["train_end"])
-                self._train_layer2(window["train_start"], window["train_end"])
-            else:
-                self._finetune_layer1(window["train_start"], window["train_end"])
-                self._finetune_layer2(window["train_start"], window["train_end"])
+            # ── Train / fine-tune L1+L2 (skip if cached) ──────────────
+            if not self._load_window_models(wi):
+                if window["mode"] == "initial":
+                    self._train_layer1(window["train_start"], window["train_end"])
+                    self._train_layer2(window["train_start"], window["train_end"])
+                else:
+                    self._finetune_layer1(window["train_start"], window["train_end"])
+                    self._finetune_layer2(window["train_start"], window["train_end"])
+                self._save_window_models(wi)
 
             # Ensure lagged IC covers test period
             test_start_year = pd.Timestamp(window["test_start"]).year
