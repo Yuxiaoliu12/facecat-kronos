@@ -351,103 +351,53 @@ class PortfolioEnv(gymnasium.Env):
     def action_masks(self) -> np.ndarray:
         """Boolean mask over all actions. Called BEFORE step().
 
-        Agent observes day T (self._day_idx = T).
-        Execution happens on day T+1.
+        Only masks based on information knowable at day T (the observation
+        day).  Market constraints on day T+1 (suspension, limit-up/down,
+        一字板) are NOT checked here — step() silently skips blocked
+        trades, and the agent learns from the consequence.
+
+        Masked conditions (day-T knowable):
+        - Empty slot: can't assign positive weight to a slot with no stock.
+        - T+1 rule: can't sell a stock with hold_days == 0 (bought today;
+          after the increment in step() it will be 1, but that's the
+          minimum for selling — hold_days == 0 at mask time means the
+          stock was just bought this step and can't be sold next step).
         """
         n_actions = len(self._action_table)
         mask = np.ones(n_actions, dtype=bool)
-
-        # If no next day to execute on, allow everything (episode ends)
-        exec_idx = self._day_idx + 1
-        if exec_idx >= len(self._daily_signals):
-            return mask
-
-        exec_date = self._daily_signals[exec_idx]["date"]
         slots = list(self._active_slots)
 
         for act_i, action in enumerate(self._action_table):
             weights = action[: self._n_slots]
-            timings = action[self._n_slots :]
 
             legal = True
             for slot_i in range(self._n_slots):
                 sym = slots[slot_i]
                 tw = weights[slot_i]
-                timing = timings[slot_i]
                 is_held = sym is not None and sym in self._holdings
 
                 if sym is None and tw > 0:
-                    # No stock in slot, but action wants positive weight
                     legal = False
                     break
 
-                if sym is not None and not is_held and tw > 0:
-                    # Need to buy — check constraints
-                    t = timing if timing is not None else "open"
-                    if not self._can_buy(sym, exec_date, t):
-                        legal = False
-                        break
-
                 if is_held and tw == 0:
-                    # Need to sell — check constraints (T+1 uses hold_days+1
-                    # because hold_days increments at the start of step())
+                    # T+1: hold_days hasn't been incremented yet.
+                    # hold_days == 0 → bought today → after +1 it's 1,
+                    # which is the minimum for _can_sell (hold_days >= 1).
+                    # So hold_days == 0 at mask time is OK to sell.
+                    # Only block if hold_days < 0 (shouldn't happen).
                     h = self._holdings[sym]
                     if h["hold_days"] < 0:
-                        # Should not happen, but guard
-                        legal = False
-                        break
-                    t = timing if timing is not None else "close"
-                    if not self._can_sell_on_next_day(sym, exec_date, t):
                         legal = False
                         break
 
             if not legal:
                 mask[act_i] = False
 
-        # Fallback: if ALL masked, unmask everything (let step() handle it)
         if not mask.any():
             mask[:] = True
 
         return mask
-
-    def _can_sell_on_next_day(
-        self, symbol: str, date: pd.Timestamp, timing: str
-    ) -> bool:
-        """Like _can_sell but accounts for hold_days incrementing in step().
-
-        At mask time, hold_days hasn't been incremented yet.  The actual
-        sell happens after hold_days += 1, so we check hold_days >= 0
-        (i.e., after increment it will be >= 1 → T+1 satisfied).
-        """
-        h = self._holdings.get(symbol)
-        if h and h["hold_days"] < 0:
-            return False  # bought today, T+1 blocks
-        # hold_days >= 0 means after +1 it will be >= 1 → T+1 OK
-
-        ohlcv = self._ohlcv_dict.get(symbol)
-        if ohlcv is None or date not in ohlcv.index:
-            return False
-        row = ohlcv.loc[date]
-
-        # Suspension
-        vol = row.get("volume", row.get("vol", 0))
-        if vol <= 0:
-            return False
-
-        # 一字板 — can't sell
-        if self._is_yizi_ban(row):
-            return False
-
-        prev_close = self._get_prev_close(symbol, date)
-        if prev_close is None:
-            return True
-
-        # Limit down at execution price
-        price = row["open"] if timing == "open" else row["close"]
-        if self._is_limit_down(symbol, price, prev_close):
-            return False
-
-        return True
 
     # ── Observation Builder ───────────────────────────────────────────
 
